@@ -402,10 +402,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     match cli.command {
-        Commands::Init { db } => {
-            init_database(&db).await?;
-            info!("Database initialized at: {}", db.display());
-        }
         Commands::Scan { paths, db, follow_links, rehash, output, min_size } => {
             // Validate all paths exist before starting
             let mut invalid_paths = Vec::new();

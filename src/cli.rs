@@ -48,12 +48,6 @@ pub enum Commands {
         #[arg(short, long)]
         min_size: Option<i64>,
     },
-    /// Initialize the database
-    Init {
-        /// Database file path
-        #[arg(short, long, default_value = DATABASE_FILE)]
-        db: PathBuf,
-    },
     /// Clear all entries from the database
     Clear {
         /// Database file path
