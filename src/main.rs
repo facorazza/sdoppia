@@ -406,7 +406,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             init_database(&db).await?;
             info!("Database initialized at: {}", db.display());
         }
-        Commands::Scan { paths, db, follow_links, rehash } => {
+        Commands::Scan { paths, db, follow_links, rehash, output, min_size } => {
             // Validate all paths exist before starting
             let mut invalid_paths = Vec::new();
             for path in &paths {
@@ -428,16 +428,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let pool = init_database(&db).await?;
             scan_multiple_directories(&pool, &paths, follow_links, rehash).await?;
-            pool.close().await;
-        }
-        Commands::Export { db, output, min_size } => {
-            if !db.exists() {
-                error!("Database does not exist: {}", db.display());
-                return Err("Database not found. Run 'init' or 'scan' first.".into());
-            }
 
-            let pool = init_database(&db).await?;
+            // Always export duplicates after scanning
             export_duplicates(&pool, output.as_deref(), min_size).await?;
+
             pool.close().await;
         }
         Commands::Clear { db } => {

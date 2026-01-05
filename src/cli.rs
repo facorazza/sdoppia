@@ -39,18 +39,12 @@ pub enum Commands {
         /// Force rehashing of files already in database
         #[arg(short = 'r', long)]
         rehash: bool,
-    },
-    /// Export list of duplicate files
-    Export {
-        /// Database file path
-        #[arg(short, long, default_value = DATABASE_FILE)]
-        db: PathBuf,
 
-        /// Output file (optional, prints to stdout if not provided)
+        /// Output file for duplicates (optional, prints to stdout if not provided)
         #[arg(short, long)]
         output: Option<PathBuf>,
 
-        /// Minimum file size in bytes to include
+        /// Minimum file size in bytes to include in export
         #[arg(short, long)]
         min_size: Option<i64>,
     },
