@@ -35,6 +35,10 @@ pub enum Commands {
         /// Follow symbolic links
         #[arg(short = 'L', long)]
         follow_links: bool,
+
+        /// Force rehashing of files already in database
+        #[arg(short = 'r', long)]
+        rehash: bool,
     },
     /// Export list of duplicate files
     Export {

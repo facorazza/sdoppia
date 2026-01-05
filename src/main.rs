@@ -75,12 +75,14 @@ async fn scan_directory(
     pool: &SqlitePool,
     directory: &Path,
     follow_links: bool,
-) -> Result<(usize, usize, usize), Box<dyn std::error::Error>> {
+    rehash: bool,
+) -> Result<(usize, usize, usize, usize), Box<dyn std::error::Error>> {
     info!("Scanning directory: {}", directory.display());
 
     let mut file_count = 0;
     let mut error_count = 0;
     let mut skipped_count = 0;
+    let mut cached_count = 0;
 
     for entry in WalkDir::new(directory)
         .follow_links(follow_links)
@@ -123,6 +125,27 @@ async fn scan_directory(
 
         let path_str = absolute_path.to_string_lossy().to_string();
 
+        // Check if file already exists in database (unless rehash flag is set)
+        if !rehash {
+            let existing: Option<(String, i64)> = sqlx::query_as(
+                "SELECT hash, size FROM file_hashes WHERE file_path = ?"
+            )
+            .bind(&path_str)
+            .fetch_optional(pool)
+            .await?;
+
+            if let Some((_existing_hash, existing_size)) = existing {
+                // File exists in DB - check if size matches
+                if existing_size == size {
+                    debug!("File already hashed, skipping: {}", path.display());
+                    cached_count += 1;
+                    continue;
+                } else {
+                    debug!("File size changed, rehashing: {}", path.display());
+                }
+            }
+        }
+
         match hash_file(path) {
             Ok(hash) => {
                 match sqlx::query(
@@ -136,8 +159,8 @@ async fn scan_directory(
                 {
                     Ok(_) => {
                         file_count += 1;
-                        if file_count % 100 == 0 {
-                            info!("Processed {} files...", file_count);
+                        if (file_count + cached_count) % 100 == 0 {
+                            info!("Processed {} files ({} cached)...", file_count + cached_count, cached_count);
                         }
                     }
                     Err(e) => {
@@ -153,7 +176,7 @@ async fn scan_directory(
         }
     }
 
-    Ok((file_count, skipped_count, error_count))
+    Ok((file_count, skipped_count, error_count, cached_count))
 }
 
 #[instrument(skip(pool))]
@@ -161,34 +184,42 @@ async fn scan_multiple_directories(
     pool: &SqlitePool,
     directories: &[PathBuf],
     follow_links: bool,
+    rehash: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting scan of {} directories", directories.len());
+    if !rehash {
+        info!("Skipping files already in database (use --rehash to force rehashing)");
+    }
 
     let mut total_files = 0;
     let mut total_skipped = 0;
     let mut total_errors = 0;
+    let mut total_cached = 0;
 
     for (idx, dir) in directories.iter().enumerate() {
         info!("Scanning directory {}/{}: {}", idx + 1, directories.len(), dir.display());
 
-        let (files, skipped, errors) = scan_directory(pool, dir, follow_links).await?;
+        let (files, skipped, errors, cached) = scan_directory(pool, dir, follow_links, rehash).await?;
 
         total_files += files;
         total_skipped += skipped;
         total_errors += errors;
+        total_cached += cached;
 
         info!(
-            "Directory {} complete: {} files, {} skipped, {} errors",
+            "Directory {} complete: {} files hashed, {} cached, {} skipped, {} errors",
             dir.display(),
             files,
+            cached,
             skipped,
             errors
         );
     }
 
     info!(
-        "All scans complete: {} total files processed, {} skipped, {} errors",
+        "All scans complete: {} files hashed, {} cached, {} skipped, {} errors",
         total_files,
+        total_cached,
         total_skipped,
         total_errors
     );
@@ -375,7 +406,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             init_database(&db).await?;
             info!("Database initialized at: {}", db.display());
         }
-        Commands::Scan { paths, db, follow_links } => {
+        Commands::Scan { paths, db, follow_links, rehash } => {
             // Validate all paths exist before starting
             let mut invalid_paths = Vec::new();
             for path in &paths {
@@ -396,7 +427,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let pool = init_database(&db).await?;
-            scan_multiple_directories(&pool, &paths, follow_links).await?;
+            scan_multiple_directories(&pool, &paths, follow_links, rehash).await?;
             pool.close().await;
         }
         Commands::Export { db, output, min_size } => {
