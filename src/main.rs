@@ -13,13 +13,13 @@ mod cli;
 use cli::{Cli, Commands};
 
 #[derive(Debug)]
-struct DuplicateGroup {
+struct Duplicates {
     hash: String,
     size: i64,
     files: Vec<String>,
 }
 
-impl DuplicateGroup {
+impl Duplicates {
     fn wasted_space(&self) -> i64 {
         self.size * (self.files.len() as i64 - 1)
     }
@@ -258,7 +258,7 @@ async fn export_duplicates(
         let paths: String = row.get("paths");
         let size: i64 = row.get("size");
 
-        duplicate_groups.push(DuplicateGroup {
+        duplicate_groups.push(Duplicates {
             hash,
             size,
             files: paths.split('|').map(String::from).collect(),
@@ -278,16 +278,16 @@ async fn export_duplicates(
     output_lines.push(format!("=== DUPLICATE FILES REPORT ==="));
     output_lines.push(format!("Generated: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")));
     output_lines.push(format!("Total duplicate files: {}", total_duplicate_count));
-    output_lines.push(format!("Wasted space: {}", DuplicateGroup::format_size(wasted_space)));
+    output_lines.push(format!("Wasted space: {}", Duplicates::format_size(wasted_space)));
     output_lines.push(format!("Duplicate groups: {}", duplicate_groups.len()));
     output_lines.push(String::new());
 
     for (idx, group) in duplicate_groups.iter().enumerate() {
         output_lines.push(format!("--- Group {} ---", idx + 1));
         output_lines.push(format!("Hash: {}", group.hash));
-        output_lines.push(format!("Size: {}", DuplicateGroup::format_size(group.size)));
+        output_lines.push(format!("Size: {}", Duplicates::format_size(group.size)));
         output_lines.push(format!("Copies: {}", group.files.len()));
-        output_lines.push(format!("Wasted: {}", DuplicateGroup::format_size(group.wasted_space())));
+        output_lines.push(format!("Wasted: {}", Duplicates::format_size(group.wasted_space())));
         output_lines.push("Files:".to_string());
 
         for path in &group.files {
@@ -348,9 +348,9 @@ async fn show_stats(pool: &SqlitePool) -> Result<(), Box<dyn std::error::Error>>
 
     info!("=== DATABASE STATISTICS ===");
     info!("Total files: {}", total_files);
-    info!("Total size: {}", DuplicateGroup::format_size(total_size));
+    info!("Total size: {}", Duplicates::format_size(total_size));
     info!("Duplicate files: {}", duplicate_files);
-    info!("Wasted space: {}", DuplicateGroup::format_size(wasted_space));
+    info!("Wasted space: {}", Duplicates::format_size(wasted_space));
 
     if total_files > 0 {
         let duplicate_percentage = (duplicate_files as f64 / total_files as f64) * 100.0;
