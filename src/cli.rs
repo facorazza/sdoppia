@@ -25,7 +25,7 @@ pub enum Commands {
     /// Scan directories and hash all files
     Scan {
         /// Directories to scan (can specify multiple)
-        #[arg(short, long, required = true)]
+        #[arg(required = true)]
         paths: Vec<PathBuf>,
 
         /// Database file path
