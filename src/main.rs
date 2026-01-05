@@ -111,7 +111,17 @@ async fn scan_directory(
             continue;
         }
 
-        let path_str = path.to_string_lossy().to_string();
+        // Convert to absolute path
+        let absolute_path = match path.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Cannot get absolute path for {}: {}", path.display(), e);
+                error_count += 1;
+                continue;
+            }
+        };
+
+        let path_str = absolute_path.to_string_lossy().to_string();
 
         match hash_file(path) {
             Ok(hash) => {
