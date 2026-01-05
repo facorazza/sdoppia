@@ -10,36 +10,10 @@ use walkdir::WalkDir;
 use std::str::FromStr;
 
 mod cli;
+mod models;
 use cli::{Cli, Commands};
+use models::Duplicates;
 
-#[derive(Debug)]
-struct Duplicates {
-    hash: String,
-    size: i64,
-    files: Vec<String>,
-}
-
-impl Duplicates {
-    fn wasted_space(&self) -> i64 {
-        self.size * (self.files.len() as i64 - 1)
-    }
-
-    fn format_size(bytes: i64) -> String {
-        const KB: i64 = 1024;
-        const MB: i64 = KB * 1024;
-        const GB: i64 = MB * 1024;
-
-        if bytes >= GB {
-            format!("{:.2} GB", bytes as f64 / GB as f64)
-        } else if bytes >= MB {
-            format!("{:.2} MB", bytes as f64 / MB as f64)
-        } else if bytes >= KB {
-            format!("{:.2} KB", bytes as f64 / KB as f64)
-        } else {
-            format!("{} bytes", bytes)
-        }
-    }
-}
 
 #[instrument(skip(db_path))]
 async fn init_database(db_path: &Path) -> Result<SqlitePool, Box<dyn std::error::Error>> {
