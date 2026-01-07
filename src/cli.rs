@@ -37,7 +37,7 @@ pub enum Commands {
         follow_links: bool,
 
         /// Force rehashing of files already in database
-        #[arg(short = 'r', long)]
+        #[arg(short = 'r', long, default_value = "false")]
         rehash: bool,
 
         /// Output file for duplicates (optional, prints to stdout if not provided)
@@ -45,8 +45,8 @@ pub enum Commands {
         output: Option<PathBuf>,
 
         /// Minimum file size in bytes to include in export
-        #[arg(short, long)]
-        min_size: Option<i64>,
+        #[arg(short, long, default_value_t = 0)]
+        min_size: i64,
     },
     /// Clear all entries from the database
     Clear {

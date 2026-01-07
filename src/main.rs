@@ -356,11 +356,11 @@ async fn scan_multiple_directories(
 async fn export_duplicates(
     pool: &SqlitePool,
     output: Option<&Path>,
-    min_size: Option<i64>,
+    min_size: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Finding duplicates...");
 
-    let query = if let Some(size) = min_size {
+    let query = if min_size > 0 {
         sqlx::query(
             r#"
             SELECT hash, COUNT(*) as count, GROUP_CONCAT(file_path, '|') as paths, size
@@ -371,7 +371,7 @@ async fn export_duplicates(
             ORDER BY size DESC
             "#,
         )
-        .bind(size)
+        .bind(min_size)
     } else {
         sqlx::query(
             r#"
