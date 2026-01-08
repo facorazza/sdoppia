@@ -1,5 +1,4 @@
 use clap::Parser;
-use memmap2::Mmap;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use sqlx::{
@@ -72,31 +71,19 @@ async fn init_database(db_path: &Path) -> Result<SqlitePool, Box<dyn std::error:
 
 #[instrument(skip(path))]
 fn hash_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let file = File::open(path)?;
-    let metadata = file.metadata()?;
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 65536];
 
-    // Use memory-mapped I/O for files larger than 1MB
-    let hash = if metadata.len() > 1_000_000 {
-        let mmap = unsafe { Mmap::map(&file)? };
-        let mut hasher = Sha256::new();
-        hasher.update(&mmap);
-        hasher.finalize()
-    } else {
-        // Buffered reading for smaller files
-        let mut hasher = Sha256::new();
-        let mut buffer = [0; 65536];
-        let mut file = file;
-
-        loop {
-            let n = file.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buffer[..n]);
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
         }
-        hasher.finalize()
-    };
+        hasher.update(&buffer[..n]);
+    }
 
+    let hash = hasher.finalize();
     Ok(format!("{:x}", hash))
 }
 
