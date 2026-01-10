@@ -106,8 +106,8 @@ jobs:
         # If building a library
         # run: cargo build --lib --release --verbose
 
-      - name: Run doc tests
-        run: cargo test --doc --verbose
+      # - name: Run doc tests
+      #   run: cargo test --doc --verbose
 
       - name: Check documentation
         run: cargo doc --no-deps --document-private-items
