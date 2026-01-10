@@ -66,7 +66,6 @@ pub async fn scan(
                 path.display()
             );
         }
-        scan_pb.finish_with_message(format!("{} files", file_count));
     }
 
     scan_pb.finish_with_message(format!("✓ Scanned {} files", file_count));
