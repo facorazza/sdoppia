@@ -1,11 +1,20 @@
 use std::path::PathBuf;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FileMetadata {
-    pub path: String,
+    pub path: PathBuf,
     pub absolute_path: PathBuf,
     pub size: i64,
     pub mtime: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct HashedFile {
+    pub path: PathBuf,
+    pub absolute_path: PathBuf,
+    pub size: i64,
+    pub mtime: i64,
+    pub hash: String,
 }
 
 #[derive(Debug)]

@@ -26,6 +26,9 @@ pub enum DedupError {
         source: std::io::Error,
     },
 
+    #[error("Channel closed unexpectedly")]
+    ChannelClosed,
+
     #[error("Database operation failed: {0}")]
     Database(#[from] sqlx::Error),
 
