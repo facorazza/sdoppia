@@ -12,17 +12,22 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tracing::{debug, error, info, instrument, warn};
+use std::time::SystemTime;
+use tracing::{error, info, instrument, warn};
 use tracing_subscriber::{self, EnvFilter};
 use walkdir::WalkDir;
 
 mod cli;
+mod error;
 mod models;
 use cli::{Cli, Commands};
+use error::{DedupError, Result};
 use models::Duplicates;
 
+const BATCH_SIZE: usize = 100;
+
 #[instrument(skip(db_path))]
-async fn init_database(db_path: &Path) -> Result<SqlitePool, Box<dyn std::error::Error>> {
+async fn init_database(db_path: &Path) -> Result<SqlitePool> {
     let db_url = format!("sqlite:{}", db_path.display());
     info!("Connecting to database: {}", db_url);
 
@@ -50,6 +55,7 @@ async fn init_database(db_path: &Path) -> Result<SqlitePool, Box<dyn std::error:
             file_path TEXT NOT NULL UNIQUE,
             hash TEXT NOT NULL,
             size INTEGER NOT NULL,
+            modified_at INTEGER NOT NULL,
             scanned_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
         "#,
@@ -70,7 +76,7 @@ async fn init_database(db_path: &Path) -> Result<SqlitePool, Box<dyn std::error:
 }
 
 #[instrument(skip(path))]
-fn hash_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+fn hash_file(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0; 65536];
@@ -91,23 +97,29 @@ struct FileEntry {
     path: String,
     hash: String,
     size: i64,
+    modified_at: i64,
+}
+
+struct CachedFileInfo {
+    hash: String,
+    size: i64,
+    modified_at: i64,
 }
 
 async fn get_existing_hashes(
     pool: &SqlitePool,
     paths: &[String],
-) -> Result<HashMap<String, (String, i64)>, Box<dyn std::error::Error>> {
+) -> Result<HashMap<String, CachedFileInfo>> {
     if paths.is_empty() {
         return Ok(HashMap::new());
     }
 
-    const BATCH_SIZE: usize = 999; // SQLite parameter limit
     let mut result = HashMap::new();
 
     for chunk in paths.chunks(BATCH_SIZE) {
         let placeholders = (0..chunk.len()).map(|_| "?").collect::<Vec<_>>().join(",");
         let query = format!(
-            "SELECT file_path, hash, size FROM file_hashes WHERE file_path IN ({})",
+            "SELECT file_path, hash, size, modified_at FROM file_hashes WHERE file_path IN ({})",
             placeholders
         );
 
@@ -122,48 +134,100 @@ async fn get_existing_hashes(
             let path: String = row.get(0);
             let hash: String = row.get(1);
             let size: i64 = row.get(2);
-            result.insert(path, (hash, size));
+            let modified_at: i64 = row.get(3);
+            result.insert(
+                path,
+                CachedFileInfo {
+                    hash,
+                    size,
+                    modified_at,
+                },
+            );
         }
     }
 
     Ok(result)
 }
 
-async fn batch_insert(
-    pool: &SqlitePool,
-    records: Vec<FileEntry>,
-) -> Result<usize, Box<dyn std::error::Error>> {
+async fn batch_insert(pool: &SqlitePool, records: Vec<FileEntry>) -> Result<usize> {
     if records.is_empty() {
         return Ok(0);
     }
 
-    const BATCH_SIZE: usize = 500;
     let mut inserted = 0;
+    let mut failed = 0;
 
     for chunk in records.chunks(BATCH_SIZE) {
-        let mut tx = pool.begin().await?;
+        // Try to insert the entire chunk first
+        let chunk_result = insert_chunk(pool, chunk).await;
 
-        for entry in chunk {
-            sqlx::query(
-                "INSERT OR REPLACE INTO file_hashes (file_path, hash, size) VALUES (?, ?, ?)",
-            )
-            .bind(&entry.path)
-            .bind(&entry.hash)
-            .bind(entry.size)
-            .execute(&mut *tx)
-            .await?;
-
-            inserted += 1;
-        }
-
-        tx.commit().await?;
-
-        if inserted % 1000 == 0 {
-            info!("Inserted {} files into database...", inserted);
+        match chunk_result {
+            Ok(count) => {
+                inserted += count;
+                if inserted % 1000 == 0 {
+                    info!("Inserted {} files into database...", inserted);
+                }
+            }
+            Err(e) => {
+                warn!("Batch insert failed, retrying individually: {}", e);
+                // Fall back to individual inserts for this chunk
+                for entry in chunk {
+                    match insert_single(pool, entry).await {
+                        Ok(_) => inserted += 1,
+                        Err(e) => {
+                            failed += 1;
+                            warn!("Failed to insert {}: {}", entry.path, e);
+                        }
+                    }
+                }
+            }
         }
     }
 
+    if failed > 0 {
+        warn!("Failed to insert {} files", failed);
+    }
+
     Ok(inserted)
+}
+
+async fn insert_chunk(pool: &SqlitePool, chunk: &[FileEntry]) -> Result<usize> {
+    let mut tx = pool.begin().await?;
+
+    for entry in chunk {
+        sqlx::query(
+            "INSERT OR REPLACE INTO file_hashes (file_path, hash, size, modified_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&entry.path)
+        .bind(&entry.hash)
+        .bind(entry.size)
+        .bind(entry.modified_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(chunk.len())
+}
+
+async fn insert_single(pool: &SqlitePool, entry: &FileEntry) -> Result<()> {
+    sqlx::query(
+        "INSERT OR REPLACE INTO file_hashes (file_path, hash, size, modified_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&entry.path)
+    .bind(&entry.hash)
+    .bind(entry.size)
+    .bind(entry.modified_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn get_modified_time(path: &Path) -> Result<i64> {
+    let metadata = std::fs::metadata(path)?;
+    let modified = metadata.modified()?;
+    let duration = modified.duration_since(SystemTime::UNIX_EPOCH)?;
+    Ok(duration.as_secs() as i64)
 }
 
 #[instrument(skip(pool))]
@@ -172,11 +236,10 @@ async fn scan_directory(
     directory: &Path,
     follow_links: bool,
     rehash: bool,
-) -> Result<(usize, usize, usize, usize), Box<dyn std::error::Error>> {
+) -> Result<(usize, usize, usize, usize)> {
     info!("Scanning directory: {}", directory.display());
 
     info!("Collecting file list...");
-    let mut size_map: HashMap<i64, Vec<PathBuf>> = HashMap::new();
     let mut all_paths = Vec::new();
 
     for entry in WalkDir::new(directory)
@@ -205,15 +268,23 @@ async fn scan_directory(
         };
 
         let path_str = absolute_path.to_string_lossy().to_string();
-        all_paths.push((path_str.clone(), absolute_path.clone(), size));
-        size_map.entry(size).or_default().push(absolute_path);
+
+        let modified_at = match get_modified_time(&absolute_path) {
+            Ok(t) => t,
+            Err(_) => {
+                warn!("Could not get modification time for: {}", path_str);
+                continue;
+            }
+        };
+
+        all_paths.push((path_str, absolute_path, size, modified_at));
     }
 
     info!("Found {} files to process", all_paths.len());
 
     // Check which files already exist in database
     let existing_hashes = if !rehash {
-        let paths: Vec<String> = all_paths.iter().map(|(p, _, _)| p.clone()).collect();
+        let paths: Vec<String> = all_paths.iter().map(|(p, _, _, _)| p.clone()).collect();
         get_existing_hashes(pool, &paths).await?
     } else {
         HashMap::new()
@@ -224,15 +295,14 @@ async fn scan_directory(
     // Determine which files need hashing
     let files_to_hash: Vec<_> = all_paths
         .into_iter()
-        .filter_map(|(path_str, absolute_path, size)| {
-            if !rehash {
-                if let Some((_, existing_size)) = existing_hashes.get(&path_str) {
-                    if *existing_size == size {
-                        return None; // Already cached
-                    }
+        .filter_map(|(path_str, absolute_path, size, modified_at)| {
+            if !rehash && let Some(cached) = existing_hashes.get(&path_str) {
+                // Check both size and modification time
+                if cached.size == size && cached.modified_at == modified_at {
+                    return None; // Already cached and unchanged
                 }
             }
-            Some((path_str, absolute_path, size))
+            Some((path_str, absolute_path, size, modified_at))
         })
         .collect();
 
@@ -243,24 +313,36 @@ async fn scan_directory(
         cached_count
     );
 
-    // Parallel hashing
+    // Parallel hashing with progress tracking
     info!("Hashing files in parallel...");
     let file_count = Arc::new(AtomicUsize::new(0));
     let error_count = Arc::new(AtomicUsize::new(0));
+    let total_to_hash = files_to_hash.len();
+
+    // Progress reporting thread
+    let progress_counter = Arc::clone(&file_count);
+    let progress_handle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            let count = progress_counter.load(Ordering::Relaxed);
+            if count >= total_to_hash {
+                break;
+            }
+            info!("Progress: {}/{} files hashed", count, total_to_hash);
+        }
+    });
 
     let results: Vec<FileEntry> = files_to_hash
         .par_iter()
         .filter_map(
-            |(path_str, absolute_path, size)| match hash_file(absolute_path) {
+            |(path_str, absolute_path, size, modified_at)| match hash_file(absolute_path) {
                 Ok(hash) => {
-                    let count = file_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count % 100 == 0 {
-                        debug!("Hashed {} files...", count);
-                    }
+                    file_count.fetch_add(1, Ordering::Relaxed);
                     Some(FileEntry {
                         path: path_str.clone(),
                         hash,
                         size: *size,
+                        modified_at: *modified_at,
                     })
                 }
                 Err(e) => {
@@ -272,6 +354,9 @@ async fn scan_directory(
         )
         .collect();
 
+    // Stop progress reporting
+    progress_handle.abort();
+
     let hashed_count = file_count.load(Ordering::Relaxed);
     let errors = error_count.load(Ordering::Relaxed);
 
@@ -280,7 +365,7 @@ async fn scan_directory(
         hashed_count, errors
     );
 
-    // Step 5: Batch insert into database
+    // Batch insert into database
     info!("Inserting into database...");
     let inserted = batch_insert(pool, results).await?;
     info!("Inserted {} files", inserted);
@@ -294,7 +379,7 @@ async fn scan_multiple_directories(
     directories: &[PathBuf],
     follow_links: bool,
     rehash: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<()> {
     info!("Starting scan of {} directories", directories.len());
     if !rehash {
         info!("Skipping files already in database (use --rehash to force rehashing)");
@@ -340,17 +425,14 @@ async fn scan_multiple_directories(
 }
 
 #[instrument(skip(pool))]
-async fn export_duplicates(
-    pool: &SqlitePool,
-    output: Option<&Path>,
-    min_size: i64,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn export_duplicates(pool: &SqlitePool, output: Option<&Path>, min_size: i64) -> Result<()> {
     info!("Finding duplicates...");
 
-    let query = if min_size > 0 {
+    // First, get duplicate hashes
+    let hash_query = if min_size > 0 {
         sqlx::query(
             r#"
-            SELECT hash, COUNT(*) as count, GROUP_CONCAT(file_path, '|') as paths, size
+            SELECT hash, COUNT(*) as count, size
             FROM file_hashes
             WHERE size >= ?
             GROUP BY hash
@@ -362,7 +444,7 @@ async fn export_duplicates(
     } else {
         sqlx::query(
             r#"
-            SELECT hash, COUNT(*) as count, GROUP_CONCAT(file_path, '|') as paths, size
+            SELECT hash, COUNT(*) as count, size
             FROM file_hashes
             GROUP BY hash
             HAVING count > 1
@@ -371,25 +453,36 @@ async fn export_duplicates(
         )
     };
 
-    let rows = query.fetch_all(pool).await?;
+    let hash_rows = hash_query.fetch_all(pool).await?;
 
-    if rows.is_empty() {
+    if hash_rows.is_empty() {
         info!("No duplicates found!");
         return Ok(());
     }
 
     let mut duplicate_groups = Vec::new();
 
-    for row in rows {
+    // Fetch files for each duplicate hash separately to avoid GROUP_CONCAT limits
+    for row in hash_rows {
         let hash: String = row.get("hash");
-        let paths: String = row.get("paths");
         let size: i64 = row.get("size");
 
-        duplicate_groups.push(Duplicates {
-            hash,
-            size,
-            files: paths.split('|').map(String::from).collect(),
-        });
+        // Fetch individual files for this hash
+        let file_rows = sqlx::query("SELECT file_path FROM file_hashes WHERE hash = ?")
+            .bind(&hash)
+            .fetch_all(pool)
+            .await?;
+
+        let files: Vec<String> = file_rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("file_path"))
+            .collect();
+
+        if files.len() < 2 {
+            continue; // Skip if we somehow don't have duplicates
+        }
+
+        duplicate_groups.push(Duplicates { hash, size, files });
     }
 
     let total_duplicate_count: usize = duplicate_groups.iter().map(|g| g.files.len() - 1).sum();
@@ -397,7 +490,7 @@ async fn export_duplicates(
 
     let mut output_lines = Vec::new();
 
-    output_lines.push(format!("=== DUPLICATE FILES REPORT ==="));
+    output_lines.push("=== DUPLICATE FILES REPORT ===".to_string());
     output_lines.push(format!(
         "Generated: {}",
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
@@ -442,7 +535,7 @@ async fn export_duplicates(
     Ok(())
 }
 
-async fn show_stats(pool: &SqlitePool) -> Result<(), Box<dyn std::error::Error>> {
+async fn show_stats(pool: &SqlitePool) -> Result<()> {
     let total_files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM file_hashes")
         .fetch_one(pool)
         .await?;
@@ -491,7 +584,7 @@ async fn show_stats(pool: &SqlitePool) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-async fn clear_database(pool: &SqlitePool) -> Result<(), Box<dyn std::error::Error>> {
+async fn clear_database(pool: &SqlitePool) -> Result<()> {
     let rows_deleted = sqlx::query("DELETE FROM file_hashes")
         .execute(pool)
         .await?
@@ -502,7 +595,7 @@ async fn clear_database(pool: &SqlitePool) -> Result<(), Box<dyn std::error::Err
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let filter = if cli.verbose {
@@ -522,22 +615,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             output,
             min_size,
         } => {
-            let mut invalid_paths = Vec::new();
             for path in &paths {
                 if !path.exists() {
-                    invalid_paths.push(path.display().to_string());
+                    error!("Invalid path: {}", path.display());
+                    return Err(DedupError::InvalidPath {
+                        path: path.display().to_string(),
+                    });
                 } else if !path.is_dir() {
                     error!("{} is not a directory", path.display());
-                    invalid_paths.push(path.display().to_string());
+                    return Err(DedupError::InvalidPath {
+                        path: path.display().to_string(),
+                    });
                 }
-            }
-
-            if !invalid_paths.is_empty() {
-                error!("Invalid paths provided:");
-                for path in invalid_paths {
-                    error!("  - {}", path);
-                }
-                return Err("One or more paths do not exist or are not directories".into());
             }
 
             let pool = init_database(&db).await?;
@@ -548,7 +637,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Clear { db } => {
             if !db.exists() {
                 error!("Database does not exist: {}", db.display());
-                return Err("Database not found.".into());
+                return Err(DedupError::InvalidPath {
+                    path: db.display().to_string(),
+                });
             }
 
             let pool = init_database(&db).await?;
@@ -558,7 +649,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Stats { db } => {
             if !db.exists() {
                 error!("Database does not exist: {}", db.display());
-                return Err("Database not found. Run 'init' or 'scan' first.".into());
+                return Err(DedupError::InvalidPath {
+                    path: db.display().to_string(),
+                });
             }
 
             let pool = init_database(&db).await?;
