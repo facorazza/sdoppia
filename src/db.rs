@@ -3,6 +3,10 @@ use std::{
     io::{BufWriter, Write},
     path::Path,
     str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use indicatif::{ProgressBar, ProgressStyle};
@@ -66,11 +70,34 @@ pub async fn database_writer(
     pool: SqlitePool,
     mut rx: mpsc::Receiver<HashedFile>,
     db_pb: ProgressBar,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<usize> {
     let mut buffer = Vec::new();
     let mut total_inserted = 0;
 
     loop {
+        // Check for shutdown signal
+        if shutdown.load(Ordering::Relaxed) {
+            warn!("Database writer received shutdown signal");
+            // Flush any remaining data in buffer before exiting
+            if !buffer.is_empty() {
+                info!(
+                    "Flushing {} remaining records before shutdown",
+                    buffer.len()
+                );
+                match save_hashes(&pool, &buffer).await {
+                    Ok(count) => {
+                        total_inserted += count;
+                        db_pb.inc(count as u64);
+                    }
+                    Err(e) => {
+                        warn!("Final batch insert failed: {}", e);
+                    }
+                }
+            }
+            break;
+        }
+
         loop {
             match rx.try_recv() {
                 Ok(file) => buffer.push(file),
@@ -127,11 +154,18 @@ pub async fn filter_files(
     rehash: bool,
     scan_pb: ProgressBar,
     hash_pb: ProgressBar,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<usize> {
     let mut sent_count = 0;
     let mut cached_count = 0;
 
     loop {
+        // Check for shutdown signal
+        if shutdown.load(Ordering::Relaxed) {
+            warn!("Filter received shutdown signal, exiting");
+            break;
+        }
+
         let file = match scanned_files_rx.try_recv() {
             Ok(file) => file,
             Err(mpsc::error::TryRecvError::Empty) => {

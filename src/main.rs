@@ -1,9 +1,10 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::{self, EnvFilter};
 
 mod cli;
@@ -39,13 +40,13 @@ async fn main() -> Result<()> {
         .init();
 
     // Set up Ctrl+C handler
-    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
     tokio::spawn(async move {
         match tokio::signal::ctrl_c().await {
             Ok(()) => {
                 warn!("Received Ctrl+C, initiating graceful shutdown...");
-                shutdown_clone.notify_waiters();
+                shutdown_clone.store(true, Ordering::SeqCst);
             }
             Err(e) => {
                 warn!("Failed to listen for Ctrl+C: {}", e);
@@ -108,8 +109,17 @@ async fn main() -> Result<()> {
 
             // Spawn tasks
             let scan_pb_clone = scan_pb.clone();
+            let shutdown_clone = Arc::clone(&shutdown);
             let scan_handle = tokio::spawn(async move {
-                match fs::scan(paths, follow_links, &scanned_files_tx, scan_pb_clone).await {
+                match fs::scan(
+                    paths,
+                    follow_links,
+                    &scanned_files_tx,
+                    scan_pb_clone,
+                    shutdown_clone,
+                )
+                .await
+                {
                     Ok(count) => {
                         drop(scanned_files_tx);
                         Ok(count)
@@ -120,6 +130,7 @@ async fn main() -> Result<()> {
 
             let scan_pb_clone = scan_pb.clone();
             let hash_pb_clone = hash_pb.clone();
+            let shutdown_clone = Arc::clone(&shutdown);
             let filter_handle = tokio::spawn(filter_files(
                 pool.clone(),
                 scanned_files_rx,
@@ -127,10 +138,11 @@ async fn main() -> Result<()> {
                 rehash,
                 scan_pb_clone,
                 hash_pb_clone,
+                shutdown_clone,
             ));
 
             let num_hashers = fs::get_num_hashers();
-            info!("Using {} hash workers", num_hashers);
+            debug!("Using {} hash workers", num_hashers);
 
             let mut hash_handles = Vec::new();
             for _ in 0..num_hashers {
@@ -138,36 +150,38 @@ async fn main() -> Result<()> {
                 let tx = hashed_files_tx.clone();
                 let hash_pb_clone = hash_pb.clone();
                 let db_pb_clone = db_pb.clone();
+                let shutdown_clone = Arc::clone(&shutdown);
 
                 hash_handles.push(tokio::spawn(async move {
-                    fs::hash_worker(rx, tx, hash_pb_clone, db_pb_clone).await;
+                    fs::hash_worker(rx, tx, hash_pb_clone, db_pb_clone, shutdown_clone).await;
                 }));
             }
 
-            let db_writer_handle =
-                tokio::spawn(database_writer(pool.clone(), hashed_files_rx, db_pb));
+            let shutdown_clone = Arc::clone(&shutdown);
+            let db_writer_handle = tokio::spawn(database_writer(
+                pool.clone(),
+                hashed_files_rx,
+                db_pb,
+                shutdown_clone,
+            ));
 
-            // Wait for completion or shutdown signal
-            tokio::select! {
-                _ = shutdown.notified() => {
-                    warn!("Shutting down gracefully...");
-                }
-                _ = async {
-                    // Wait for pipeline stages in order
-                    let _ = scan_handle.await;
-                    info!("Scanner completed");
+            // Wait for scanner to finish
+            let _ = scan_handle.await;
+            info!("Scanner finished");
 
-                    let _ = filter_handle.await;
-                    info!("Filter completed");
-                } => {}
-            }
+            // Wait for filter to finish processing scanned files
+            let _ = filter_handle.await;
+            info!("Filter finished");
+
+            // Drop the filtered_files_tx to signal hash workers no more files are coming
+            drop(hashed_files_tx);
 
             // Wait for hash workers to finish processing
             info!("Waiting for {} hash workers to complete...", num_hashers);
             for handle in hash_handles {
                 let _ = handle.await;
             }
-            info!("Hash workers completed");
+            info!("All files have been hashed");
 
             // Wait for database writer to flush all data
             info!("Saving hashes to database...");
@@ -179,7 +193,6 @@ async fn main() -> Result<()> {
         Commands::Clear { db } => {
             let pool = init_database(&db).await?;
             clear_database(&pool).await?;
-            pool.close().await;
         }
         Commands::Stats { db } => {
             let pool = init_database(&db).await?;

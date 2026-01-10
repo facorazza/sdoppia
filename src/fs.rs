@@ -2,7 +2,10 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::SystemTime,
 };
 
@@ -17,17 +20,24 @@ use crate::{
     models::{FileMetadata, HashedFile},
 };
 
-#[instrument(skip(fs_scanner_tx, scan_pb))]
+#[instrument(skip(fs_scanner_tx, scan_pb, shutdown))]
 pub async fn scan(
     paths: Vec<PathBuf>,
     follow_links: bool,
     fs_scanner_tx: &mpsc::Sender<FileMetadata>,
     scan_pb: ProgressBar,
-    // shutdown: Arc<tokio::sync::Notify>,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<usize> {
     let mut file_count = 0;
 
     for path in &paths {
+        // Check for shutdown signal
+        if shutdown.load(Ordering::Relaxed) {
+            warn!("Shutdown signal received during scan");
+            scan_pb.finish_with_message(format!("⚠ Interrupted: Scanned {} files", file_count));
+            return Ok(file_count);
+        }
+
         scan_pb.set_message(format!("{} files", file_count));
 
         if !path.exists() {
@@ -46,6 +56,16 @@ pub async fn scan(
                 .into_iter()
                 .filter_map(|e| e.ok())
             {
+                // Check for shutdown during directory walk
+                if shutdown.load(Ordering::Relaxed) {
+                    warn!("Shutdown signal received during directory scan");
+                    scan_pb.finish_with_message(format!(
+                        "⚠ Interrupted: Scanned {} files",
+                        file_count
+                    ));
+                    return Ok(file_count);
+                }
+
                 if !entry.file_type().is_file() {
                     continue;
                 }
@@ -113,33 +133,47 @@ pub async fn hash_worker(
     db_insertion_tx: mpsc::Sender<HashedFile>,
     hash_pb: ProgressBar,
     db_pb: ProgressBar,
+    shutdown: Arc<AtomicBool>,
 ) {
     loop {
+        // Check for shutdown signal
+        if shutdown.load(Ordering::Relaxed) {
+            debug!("Hash worker received shutdown signal, exiting");
+            break;
+        }
+
         let file = {
             let mut locked_rx = scanned_files_rx.lock().await;
             locked_rx.recv().await
         };
 
         match file {
-            Some(file) => match hash_file(&file.absolute_path) {
-                Ok(hash) => {
-                    let hashed = HashedFile {
-                        absolute_path: file.absolute_path,
-                        size: file.size,
-                        mtime: file.mtime,
-                        hash,
-                    };
+            Some(file) => {
+                // Check shutdown before processing
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
 
-                    if db_insertion_tx.send(hashed).await.is_ok() {
+                match hash_file(&file.absolute_path) {
+                    Ok(hash) => {
+                        let hashed = HashedFile {
+                            absolute_path: file.absolute_path,
+                            size: file.size,
+                            mtime: file.mtime,
+                            hash,
+                        };
+
+                        if db_insertion_tx.send(hashed).await.is_ok() {
+                            hash_pb.inc(1);
+                            db_pb.inc_length(1);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to hash {}: {}", file.path.display(), e);
                         hash_pb.inc(1);
-                        db_pb.inc_length(1);
                     }
                 }
-                Err(e) => {
-                    warn!("Failed to hash {}: {}", file.path.display(), e);
-                    hash_pb.inc(1);
-                }
-            },
+            }
             None => break,
         }
     }
