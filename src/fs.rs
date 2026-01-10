@@ -1,16 +1,21 @@
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::SystemTime,
+};
+
 use indicatif::ProgressBar;
 use sha2::{Digest, Sha256};
-use std::fs::File;
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::SystemTime;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, instrument, warn};
 use walkdir::WalkDir;
 
-use crate::error::{DedupError, Result};
-use crate::models::{FileMetadata, HashedFile};
+use crate::{
+    error::{DedupError, Result},
+    models::{FileMetadata, HashedFile},
+};
 
 #[instrument(skip(fs_scanner_tx, scan_pb))]
 pub async fn scan(

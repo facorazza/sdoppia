@@ -1,25 +1,24 @@
+use std::{
+    fs::File,
+    io::{BufWriter, Write},
+    path::Path,
+    str::FromStr,
+};
+
 use indicatif::{ProgressBar, ProgressStyle};
-use sqlx::Row;
-use sqlx::SqlitePool;
-use sqlx::sqlite::SqliteConnectOptions;
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::Path;
-use std::str::FromStr;
+use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions};
 use tokio::sync::mpsc;
-use tracing::info;
-use tracing::instrument;
-use tracing::warn;
+use tracing::{debug, info, instrument, warn};
 
-use crate::error::Result;
-use crate::models::{Duplicates, FileMetadata, HashedFile};
-
-const BATCH_SIZE: usize = 100;
+use crate::{
+    error::Result,
+    models::{Duplicates, FileMetadata, HashedFile},
+};
 
 #[instrument(skip(db_path))]
 pub async fn init_database(db_path: &Path) -> Result<SqlitePool> {
     let db_url = format!("sqlite:{}", db_path.display());
-    info!("Connecting to database: {}", db_url);
+    debug!("Connecting to database: {}", db_url);
 
     let options = SqliteConnectOptions::from_str(&db_url)?
         .create_if_missing(true)
@@ -59,7 +58,7 @@ pub async fn init_database(db_path: &Path) -> Result<SqlitePool> {
         .execute(&pool)
         .await?;
 
-    info!("Database initialized successfully");
+    debug!("Database initialized successfully");
     Ok(pool)
 }
 

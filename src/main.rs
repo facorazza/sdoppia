@@ -1,6 +1,7 @@
+use std::sync::Arc;
+
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use tracing_subscriber::{self, EnvFilter};
