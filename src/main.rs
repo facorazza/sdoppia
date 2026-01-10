@@ -1,9 +1,10 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use tracing_subscriber::{self, EnvFilter};
 
@@ -98,14 +99,17 @@ async fn main() -> Result<()> {
             );
             db_pb.enable_steady_tick(std::time::Duration::from_millis(30));
 
-            // Spawn channels
-            let (scanned_files_tx, scanned_files_rx) = mpsc::channel::<FileMetadata>(QUEUE_SIZE);
+            // Spawn channels - all using crossbeam
+            let (scanned_files_tx, scanned_files_rx) =
+                crossbeam_channel::bounded::<FileMetadata>(QUEUE_SIZE);
 
-            let (filtered_files_tx, filtered_files_rx) = mpsc::channel::<FileMetadata>(QUEUE_SIZE);
+            // Use crossbeam channel for sending to rayon workers
+            let (filtered_files_tx, filtered_files_rx) =
+                crossbeam_channel::bounded::<FileMetadata>(QUEUE_SIZE);
 
-            let filtered_files_rx = Arc::new(tokio::sync::Mutex::new(filtered_files_rx));
-
-            let (hashed_files_tx, hashed_files_rx) = mpsc::channel::<HashedFile>(QUEUE_SIZE);
+            // Use crossbeam channel for receiving from rayon workers
+            let (hashed_files_tx, hashed_files_rx) =
+                crossbeam_channel::bounded::<HashedFile>(QUEUE_SIZE);
 
             // Spawn tasks
             let scan_pb_clone = scan_pb.clone();
@@ -131,10 +135,11 @@ async fn main() -> Result<()> {
             let scan_pb_clone = scan_pb.clone();
             let hash_pb_clone = hash_pb.clone();
             let shutdown_clone = Arc::clone(&shutdown);
+            let filtered_files_tx_clone = filtered_files_tx.clone();
             let filter_handle = tokio::spawn(filter_files(
                 pool.clone(),
                 scanned_files_rx,
-                filtered_files_tx,
+                filtered_files_tx_clone,
                 rehash,
                 scan_pb_clone,
                 hash_pb_clone,
@@ -144,18 +149,17 @@ async fn main() -> Result<()> {
             let num_hashers = fs::get_num_hashers();
             debug!("Using {} hash workers", num_hashers);
 
-            let mut hash_handles = Vec::new();
-            for _ in 0..num_hashers {
-                let rx = Arc::clone(&filtered_files_rx);
-                let tx = hashed_files_tx.clone();
-                let hash_pb_clone = hash_pb.clone();
-                let db_pb_clone = db_pb.clone();
-                let shutdown_clone = Arc::clone(&shutdown);
-
-                hash_handles.push(tokio::spawn(async move {
-                    fs::hash_worker(rx, tx, hash_pb_clone, db_pb_clone, shutdown_clone).await;
-                }));
-            }
+            // Spawn rayon-based hash workers
+            let hash_pb_clone = hash_pb.clone();
+            let db_pb_clone = db_pb.clone();
+            let shutdown_clone = Arc::clone(&shutdown);
+            let hash_handle = fs::spawn_hash_workers(
+                filtered_files_rx,
+                hashed_files_tx.clone(),
+                hash_pb_clone,
+                db_pb_clone,
+                shutdown_clone,
+            );
 
             let shutdown_clone = Arc::clone(&shutdown);
             let db_writer_handle = tokio::spawn(database_writer(
@@ -173,14 +177,18 @@ async fn main() -> Result<()> {
             let _ = filter_handle.await;
             info!("Filter finished");
 
-            // Drop the filtered_files_tx to signal hash workers no more files are coming
-            drop(hashed_files_tx);
+            // Drop filtered_files_tx to signal hash workers no more files are coming
+            drop(filtered_files_tx);
 
-            // Wait for hash workers to finish processing
-            info!("Waiting for {} hash workers to complete...", num_hashers);
-            for handle in hash_handles {
-                let _ = handle.await;
+            // Wait for rayon hash workers to finish
+            info!("Waiting for rayon hash workers to complete...");
+            if let Err(e) = hash_handle.join() {
+                warn!("Hash worker thread panicked: {:?}", e);
             }
+            info!("All files have been hashed");
+
+            // Drop hashed_files_tx to signal database writer no more hashes coming
+            drop(hashed_files_tx);
 
             // Wait for database writer to flush all data
             info!("Saving hashes to database...");

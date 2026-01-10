@@ -9,9 +9,9 @@ use std::{
     },
 };
 
+use crossbeam_channel::{Receiver, Sender};
 use indicatif::{ProgressBar, ProgressStyle};
 use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions};
-use tokio::sync::mpsc;
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
@@ -68,7 +68,7 @@ pub async fn init_database(db_path: &Path) -> Result<SqlitePool> {
 
 pub async fn database_writer(
     pool: SqlitePool,
-    mut rx: mpsc::Receiver<HashedFile>,
+    rx: Receiver<HashedFile>,
     db_pb: ProgressBar,
     shutdown: Arc<AtomicBool>,
 ) -> Result<usize> {
@@ -101,8 +101,8 @@ pub async fn database_writer(
         loop {
             match rx.try_recv() {
                 Ok(file) => buffer.push(file),
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
             }
         }
 
@@ -117,10 +117,6 @@ pub async fn database_writer(
                 }
             }
             buffer.clear();
-        }
-
-        if rx.is_closed() {
-            break;
         }
 
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -149,8 +145,8 @@ async fn save_hashes(pool: &SqlitePool, files: &[HashedFile]) -> Result<usize> {
 
 pub async fn filter_files(
     pool: SqlitePool,
-    mut scanned_files_rx: mpsc::Receiver<FileMetadata>,
-    filtered_files_tx: mpsc::Sender<FileMetadata>,
+    scanned_files_rx: Receiver<FileMetadata>,
+    filtered_files_tx: Sender<FileMetadata>,
     rehash: bool,
     scan_pb: ProgressBar,
     hash_pb: ProgressBar,
@@ -168,11 +164,11 @@ pub async fn filter_files(
 
         let file = match scanned_files_rx.try_recv() {
             Ok(file) => file,
-            Err(mpsc::error::TryRecvError::Empty) => {
+            Err(crossbeam_channel::TryRecvError::Empty) => {
                 tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                 continue;
             }
-            Err(mpsc::error::TryRecvError::Disconnected) => break,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
         };
 
         if !rehash {
@@ -198,7 +194,7 @@ pub async fn filter_files(
             }
         }
 
-        if filtered_files_tx.send(file).await.is_ok() {
+        if filtered_files_tx.send(file).is_ok() {
             sent_count += 1;
             hash_pb.set_length(sent_count as u64);
         }

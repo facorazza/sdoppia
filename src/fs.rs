@@ -9,9 +9,10 @@ use std::{
     time::SystemTime,
 };
 
+use crossbeam_channel::{Receiver, Sender};
 use indicatif::ProgressBar;
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, instrument, warn};
 use walkdir::WalkDir;
 
@@ -24,7 +25,7 @@ use crate::{
 pub async fn scan(
     paths: Vec<PathBuf>,
     follow_links: bool,
-    fs_scanner_tx: &mpsc::Sender<FileMetadata>,
+    fs_scanner_tx: &Sender<FileMetadata>,
     scan_pb: ProgressBar,
     shutdown: Arc<AtomicBool>,
 ) -> Result<usize> {
@@ -88,7 +89,7 @@ pub async fn scan(
     Ok(file_count)
 }
 
-async fn send_file(fs_scanner_tx: &mpsc::Sender<FileMetadata>, path: &Path) -> Result<()> {
+async fn send_file(fs_scanner_tx: &Sender<FileMetadata>, path: &Path) -> Result<()> {
     debug!("Processing file: {}", path.display());
 
     let metadata = std::fs::metadata(path)?;
@@ -106,7 +107,7 @@ async fn send_file(fs_scanner_tx: &mpsc::Sender<FileMetadata>, path: &Path) -> R
         mtime,
     };
 
-    if fs_scanner_tx.send(file_meta).await.is_err() {
+    if fs_scanner_tx.send(file_meta).is_err() {
         debug!(
             "Channel closed while sending file metadata for: {}",
             path.display()
@@ -130,55 +131,48 @@ pub fn get_num_hashers() -> usize {
     std::cmp::max(1, cores.saturating_sub(2))
 }
 
-pub async fn hash_worker(
-    scanned_files_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<FileMetadata>>>,
-    db_insertion_tx: mpsc::Sender<HashedFile>,
+pub fn spawn_hash_workers(
+    scanned_files_rx: Receiver<FileMetadata>,
+    hashed_files_tx: Sender<HashedFile>,
     hash_pb: ProgressBar,
     db_pb: ProgressBar,
     shutdown: Arc<AtomicBool>,
-) {
-    loop {
-        // Check for shutdown signal
-        if shutdown.load(Ordering::Relaxed) {
-            debug!("Hash worker received shutdown signal, exiting");
-            break;
-        }
+) -> std::thread::JoinHandle<()> {
+    let num_threads = get_num_hashers();
+    debug!("Thread pool initialized with {} threads", num_threads);
 
-        let file = {
-            let mut locked_rx = scanned_files_rx.lock().await;
-            locked_rx.recv().await
-        };
+    std::thread::spawn(move || {
+        // Use rayon's parallel iterator to process files
+        scanned_files_rx.into_iter().par_bridge().for_each(|file| {
+            // Check for shutdown signal
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
 
-        match file {
-            Some(file) => {
-                // Check shutdown before processing
-                if shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
+            debug!("Hashing {}", file.path.display());
 
-                match hash_file(&file.absolute_path) {
-                    Ok(hash) => {
-                        let hashed = HashedFile {
-                            absolute_path: file.absolute_path,
-                            size: file.size,
-                            mtime: file.mtime,
-                            hash,
-                        };
+            match hash_file(&file.absolute_path) {
+                Ok(hash) => {
+                    let hashed = HashedFile {
+                        absolute_path: file.absolute_path,
+                        size: file.size,
+                        mtime: file.mtime,
+                        hash,
+                    };
 
-                        if db_insertion_tx.send(hashed).await.is_ok() {
-                            hash_pb.inc(1);
-                            db_pb.inc_length(1);
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to hash {}: {}", file.path.display(), e);
+                    if hashed_files_tx.send(hashed).is_ok() {
                         hash_pb.inc(1);
+                        db_pb.inc_length(1);
                     }
+                }
+                Err(e) => {
+                    warn!("Failed to hash {}: {}", file.path.display(), e);
+                    hash_pb.inc(1);
                 }
             }
-            None => break,
-        }
-    }
+        });
+        debug!("Hash workers finished processing");
+    })
 }
 
 #[instrument(skip(path))]
