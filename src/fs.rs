@@ -19,7 +19,7 @@ pub async fn scan(
     fs_scanner_tx: &mpsc::Sender<FileMetadata>,
     scan_pb: &ProgressBar,
     // shutdown: Arc<tokio::sync::Notify>,
-) -> Result<()> {
+) -> Result<usize> {
     let mut file_count = 0;
 
     for path in &paths {
@@ -37,6 +37,7 @@ pub async fn scan(
         if path.is_file() {
             send_file(fs_scanner_tx, path).await?;
             file_count += 1;
+            scan_pb.set_message(format!("✓ Scanned 1 file: {}", path.display()));
         } else if path.is_dir() {
             for entry in WalkDir::new(path)
                 .follow_links(follow_links)
@@ -64,7 +65,8 @@ pub async fn scan(
         scan_pb.finish_with_message(format!("{} files", file_count));
     }
 
-    Ok(())
+    scan_pb.finish_with_message(format!("✓ Scanned {} files", file_count));
+    Ok(file_count)
 }
 
 async fn send_file(fs_scanner_tx: &mpsc::Sender<FileMetadata>, path: &Path) -> Result<()> {
@@ -112,7 +114,8 @@ pub fn get_num_hashers() -> usize {
 pub async fn hash_worker(
     scanned_files_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<FileMetadata>>>,
     db_insertion_tx: mpsc::Sender<HashedFile>,
-    hash_pb: Arc<ProgressBar>,
+    hash_pb: ProgressBar,
+    db_pb: ProgressBar,
 ) {
     loop {
         let file = {
@@ -132,6 +135,7 @@ pub async fn hash_worker(
 
                     if db_insertion_tx.send(hashed).await.is_ok() {
                         hash_pb.inc(1);
+                        db_pb.inc_length(1);
                     }
                 }
                 Err(e) => {

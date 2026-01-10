@@ -127,6 +127,7 @@ pub async fn filter_files(
     filtered_files_tx: mpsc::Sender<FileMetadata>,
     rehash: bool,
     filter_pb: ProgressBar,
+    hash_pb: ProgressBar,
 ) -> Result<usize> {
     let mut sent_count = 0;
     let mut cached_count = 0;
@@ -168,6 +169,7 @@ pub async fn filter_files(
 
         if filtered_files_tx.send(file).await.is_ok() {
             sent_count += 1;
+            hash_pb.set_length(sent_count as u64);
         }
     }
 

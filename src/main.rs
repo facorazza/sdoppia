@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
             );
             filter_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-            let hash_pb = Arc::new(multi_progress_bar.add(ProgressBar::new(0)));
+            let hash_pb = multi_progress_bar.add(ProgressBar::new(0));
             hash_pb.set_style(
                 ProgressStyle::default_bar()
                     .template("{spinner:.cyan} [{elapsed_precise}] Hash: [{bar:40.cyan/blue}] {pos}/{len} {percent}% ({per_sec}, ETA: {eta}) {msg}")
@@ -115,8 +115,17 @@ async fn main() -> Result<()> {
             let (hashed_files_tx, hashed_files_rx) = mpsc::channel::<HashedFile>(QUEUE_SIZE);
 
             // Spawn tasks
+            let filter_pb_clone = filter_pb.clone();
+            let hash_pb_clone = hash_pb.clone();
             let scan_handle = tokio::spawn(async move {
-                fs::scan(paths, follow_links, &scanned_files_tx, &scan_pb).await
+                match fs::scan(paths, follow_links, &scanned_files_tx, &scan_pb).await {
+                    Ok(count) => {
+                        filter_pb_clone.set_length(count as u64);
+                        drop(scanned_files_tx);
+                        Ok(count)
+                    }
+                    Err(e) => Err(e),
+                }
             });
 
             let filter_handle = tokio::spawn(filter_files(
@@ -124,7 +133,8 @@ async fn main() -> Result<()> {
                 scanned_files_rx,
                 filtered_files_tx,
                 rehash,
-                filter_pb,
+                filter_pb.clone(),
+                hash_pb_clone,
             ));
 
             let num_hashers = fs::get_num_hashers();
@@ -134,10 +144,11 @@ async fn main() -> Result<()> {
             for _ in 0..num_hashers {
                 let rx = Arc::clone(&filtered_files_rx);
                 let tx = hashed_files_tx.clone();
-                let pb = Arc::clone(&hash_pb);
+                let hash_pb_clone = hash_pb.clone();
+                let db_pb_clone = db_pb.clone();
 
                 hash_handles.push(tokio::spawn(async move {
-                    fs::hash_worker(rx, tx, pb).await;
+                    fs::hash_worker(rx, tx, hash_pb_clone, db_pb_clone).await;
                 }));
             }
 
