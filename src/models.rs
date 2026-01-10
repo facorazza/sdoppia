@@ -1,3 +1,13 @@
+use std::path::PathBuf;
+
+#[derive(Clone)]
+pub struct FileMetadata {
+    pub path: String,
+    pub absolute_path: PathBuf,
+    pub size: i64,
+    pub mtime: i64,
+}
+
 #[derive(Debug)]
 pub struct Duplicates {
     pub hash: String,
