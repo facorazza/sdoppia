@@ -171,27 +171,27 @@ async fn main() -> Result<()> {
 
             // Wait for scanner to finish
             let _ = scan_handle.await;
-            info!("Scanner finished");
+            debug!("Scanner finished");
 
             // Wait for filter to finish processing scanned files
             let _ = filter_handle.await;
-            info!("Filter finished");
+            debug!("Filter finished");
 
             // Drop filtered_files_tx to signal hash workers no more files are coming
             drop(filtered_files_tx);
 
             // Wait for rayon hash workers to finish
-            info!("Waiting for rayon hash workers to complete...");
+            debug!("Waiting for rayon hash workers to complete...");
             if let Err(e) = hash_handle.join() {
                 warn!("Hash worker thread panicked: {:?}", e);
             }
-            info!("All files have been hashed");
+            debug!("All files have been hashed");
 
             // Drop hashed_files_tx to signal database writer no more hashes coming
             drop(hashed_files_tx);
 
             // Wait for database writer to flush all data
-            info!("Saving hashes to database...");
+            debug!("Saving hashes to database...");
             let _ = db_writer_handle.await;
 
             export_duplicates(&pool, output.as_deref(), min_size).await?;
