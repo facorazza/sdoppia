@@ -176,14 +176,19 @@ pub async fn filter_files(
         };
 
         if !rehash {
-            match sqlx::query("SELECT id FROM hashes WHERE path = ?")
+            match sqlx::query("SELECT mtime FROM hashes WHERE path = ?")
                 .bind(file.absolute_path.to_string_lossy())
                 .fetch_one(&pool)
                 .await
             {
-                Ok(_) => {
-                    cached_count += 1;
-                    continue;
+                Ok(row) => {
+                    let stored_mtime: i64 = row.get("mtime");
+                    if stored_mtime == file.mtime {
+                        // File hasn't been modified, use cached hash
+                        cached_count += 1;
+                        continue;
+                    }
+                    // File has been modified, need to rehash
                 }
                 Err(sqlx::Error::RowNotFound) => (),
                 Err(e) => {
