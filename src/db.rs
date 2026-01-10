@@ -142,7 +142,7 @@ pub async fn filter_files(
         };
 
         if !rehash {
-            match sqlx::query("SELECT id FROM hashes WHERE path IN (?)")
+            match sqlx::query("SELECT id FROM hashes WHERE path = ?")
                 .bind(file.absolute_path.to_string_lossy())
                 .fetch_one(&pool)
                 .await
