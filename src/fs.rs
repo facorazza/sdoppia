@@ -12,13 +12,6 @@ use walkdir::WalkDir;
 use crate::error::{DedupError, Result};
 use crate::models::{FileMetadata, HashedFile};
 
-pub fn get_num_hashers() -> usize {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    std::cmp::max(1, cores.saturating_sub(2))
-}
-
 #[instrument(skip(fs_scanner_tx, multi_progress))]
 pub async fn scan(
     paths: Vec<PathBuf>,
@@ -70,7 +63,7 @@ pub async fn scan(
 
                 send_file(fs_scanner_tx, entry.path()).await?;
                 file_count += 1;
-                
+
                 if file_count % 100 == 0 {
                     dir_pb.set_message(format!(
                         "{}: {} files",
@@ -125,6 +118,13 @@ fn get_modified_time(path: &Path) -> Result<i64> {
     let modified = metadata.modified()?;
     let duration = modified.duration_since(SystemTime::UNIX_EPOCH)?;
     Ok(duration.as_secs() as i64)
+}
+
+pub fn get_num_hashers() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    std::cmp::max(1, cores.saturating_sub(2))
 }
 
 pub async fn hash_worker(
