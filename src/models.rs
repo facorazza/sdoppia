@@ -10,7 +10,6 @@ pub struct FileMetadata {
 
 #[derive(Clone, Debug)]
 pub struct HashedFile {
-    pub path: PathBuf,
     pub absolute_path: PathBuf,
     pub size: i64,
     pub mtime: i64,

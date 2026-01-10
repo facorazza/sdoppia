@@ -46,7 +46,7 @@ pub async fn scan(
         path_pb.set_message(format!("Scanning path: {}", path.display()));
 
         if path.is_file() {
-            send_file(&fs_scanner_tx, path).await?;
+            send_file(fs_scanner_tx, path).await?;
             file_count += 1;
         } else if path.is_dir() {
             let dir_pb = multi_progress.add(ProgressBar::new_spinner());
@@ -66,7 +66,7 @@ pub async fn scan(
                     continue;
                 }
 
-                send_file(&fs_scanner_tx, entry.path()).await?;
+                send_file(fs_scanner_tx, entry.path()).await?;
                 file_count += 1;
             }
 
@@ -132,7 +132,6 @@ pub async fn hash_worker(
             Some(file) => match hash_file(&file.absolute_path) {
                 Ok(hash) => {
                     let hashed = HashedFile {
-                        path: file.path,
                         absolute_path: file.absolute_path,
                         size: file.size,
                         mtime: file.mtime,

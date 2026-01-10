@@ -154,7 +154,6 @@ async fn get_existing_hashes(
             result.insert(
                 path.clone(),
                 HashedFile {
-                    path: path.clone().into(),
                     absolute_path: path.into(),
                     size,
                     mtime,
@@ -181,6 +180,7 @@ pub async fn filter_files(
     filter_pb.set_message("Checking cache...");
 
     loop {
+        batch.clear();
         loop {
             match scanned_files_rx.try_recv() {
                 Ok(file) => batch.push(file),
@@ -189,49 +189,48 @@ pub async fn filter_files(
             }
         }
 
-        if !batch.is_empty() {
-            // Query database for cached hashes
-            let existing_hashes = if !rehash {
-                let paths: Vec<String> = batch
-                    .iter()
-                    .map(|f| f.path.to_string_lossy().to_string())
-                    .collect();
-                get_existing_hashes(&pool, &paths).await?
-            } else {
-                HashMap::new()
-            };
-
-            // Filter and send files that need hashing
-            for file in batch.drain(..) {
-                if !rehash {
-                    if let Some(cached) =
-                        existing_hashes.get(&file.path.to_string_lossy().to_string())
-                    {
-                        if cached.size == file.size && cached.mtime == file.mtime {
-                            cached_count += 1;
-                            filter_pb.set_message(format!(
-                                "Cached: {}, Need hashing: {}",
-                                cached_count, sent_count
-                            ));
-                            continue;
-                        }
-                    }
-                }
-
-                if filtered_files_tx.send(file).await.is_ok() {
-                    sent_count += 1;
-                    filter_pb.set_message(format!(
-                        "Cached: {}, Need hashing: {}",
-                        cached_count, sent_count
-                    ));
-                }
-            }
-
+        if batch.is_empty() {
             if scanned_files_rx.is_closed() {
                 break;
             }
-
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            continue;
+        }
+
+        // Query database for cached hashes
+        let existing_hashes = if !rehash {
+            let paths: Vec<String> = batch
+                .iter()
+                .map(|f| f.absolute_path.to_string_lossy().to_string())
+                .collect();
+            get_existing_hashes(&pool, &paths).await?
+        } else {
+            HashMap::new()
+        };
+
+        // Filter and send files that need hashing
+        for file in batch.drain(..) {
+            if !rehash
+                && let Some(cached) =
+                    existing_hashes.get(&file.absolute_path.to_string_lossy().to_string())
+                && cached.size == file.size
+                && cached.mtime == file.mtime
+            {
+                cached_count += 1;
+                filter_pb.set_message(format!(
+                    "Cached: {}, Need hashing: {}",
+                    cached_count, sent_count
+                ));
+                continue;
+            }
+
+            if filtered_files_tx.send(file).await.is_ok() {
+                sent_count += 1;
+                filter_pb.set_message(format!(
+                    "Cached: {}, Need hashing: {}",
+                    cached_count, sent_count
+                ));
+            }
         }
     }
 
@@ -239,9 +238,6 @@ pub async fn filter_files(
         "Cached: {}, Need hashing: {}",
         cached_count, sent_count
     ));
-
-    // Close sender to signal completion
-    drop(filtered_files_tx);
 
     Ok(sent_count)
 }

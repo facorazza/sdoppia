@@ -101,7 +101,7 @@ async fn main() -> Result<()> {
             let (filtered_files_tx, filtered_files_rx) = mpsc::channel::<FileMetadata>(QUEUE_SIZE);
 
             let filtered_files_rx = Arc::new(tokio::sync::Mutex::new(filtered_files_rx));
-            
+
             let (hashed_files_tx, hashed_files_rx) = mpsc::channel::<HashedFile>(QUEUE_SIZE);
 
             // Spawn tasks
