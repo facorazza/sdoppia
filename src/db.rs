@@ -98,7 +98,7 @@ pub async fn database_writer(
             break;
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     }
 
     db_pb.finish_with_message(format!("Inserted {} records", total_inserted));
@@ -231,7 +231,7 @@ pub async fn filter_files(
                 break;
             }
 
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
     }
 
