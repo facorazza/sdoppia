@@ -19,6 +19,8 @@ use error::Result;
 use models::{FileMetadata, HashedFile};
 
 const QUEUE_SIZE: usize = 1000;
+const PROGRESS_CHARS: &str = "█▉▊▋▌▍▎▏  ";
+const TICK_CHARS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -67,19 +69,19 @@ async fn main() -> Result<()> {
             let scan_pb = multi_progress_bar.add(ProgressBar::new_spinner());
             scan_pb.set_style(
                 ProgressStyle::default_spinner()
-                    .template("{spinner:.green} [{elapsed_precise}] Scanning files: {msg}")
+                    .template("{spinner:.green} Scanning files: {msg}")
                     .unwrap()
-                    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+                    .tick_chars(TICK_CHARS),
             );
             scan_pb.enable_steady_tick(std::time::Duration::from_millis(30));
 
             let hash_pb = multi_progress_bar.add(ProgressBar::new(0));
             hash_pb.set_style(
                 ProgressStyle::default_bar()
-                    .template("{spinner:.cyan} [{elapsed_precise}] Hashing files: [{bar:40.cyan/blue}] {pos}/{len} {percent}% ({per_sec}, ETA: {eta}) {msg}")
+                    .template("{spinner:.cyan} Hashing files: [{bar:40.cyan/blue}] {pos}/{len} {percent}% ({per_sec}, Elapsed: {elapsed_precise}, ETA: {eta}) {msg}")
                     .unwrap()
-                    .progress_chars("█▉▊▋▌▍▎▏  ")
-                    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+                    .progress_chars(PROGRESS_CHARS)
+                    .tick_chars(TICK_CHARS),
             );
             hash_pb.enable_steady_tick(std::time::Duration::from_millis(30));
 
@@ -87,11 +89,11 @@ async fn main() -> Result<()> {
             db_pb.set_style(
                 ProgressStyle::default_bar()
                     .template(
-                        "{spinner:.yellow} [{elapsed_precise}] Writing to database: [{bar:40.yellow/blue}] {pos}/{len} {percent}% ({per_sec}) {msg}",
+                        "{spinner:.yellow} Writing to database: [{bar:40.yellow/blue}] {pos}/{len} {percent}% ({per_sec}, Elapsed: {elapsed_precise}) {msg}",
                     )
                     .unwrap()
-                    .progress_chars("█▉▊▋▌▍▎▏  ")
-                    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+                    .progress_chars(PROGRESS_CHARS)
+                    .tick_chars(TICK_CHARS),
             );
             db_pb.enable_steady_tick(std::time::Duration::from_millis(30));
 

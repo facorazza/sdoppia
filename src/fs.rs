@@ -28,15 +28,13 @@ pub async fn scan(
     let mut file_count = 0;
 
     for path in &paths {
+        scan_pb.set_message(format!("{} files", file_count));
+
         if !path.exists() {
             error!("Path does not exist: {}", path.display());
             return Err(DedupError::InvalidPath {
                 path: path.display().to_string(),
             });
-        }
-
-        if file_count % 10 == 0 {
-            scan_pb.set_message(format!("{} files", file_count));
         }
 
         if path.is_file() {
@@ -54,10 +52,6 @@ pub async fn scan(
 
                 send_file(fs_scanner_tx, entry.path()).await?;
                 file_count += 1;
-
-                if file_count % 10 == 0 {
-                    scan_pb.set_message(format!("{} files", file_count));
-                }
             }
 
             info!(

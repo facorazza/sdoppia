@@ -132,19 +132,6 @@ pub async fn filter_files(
     let mut cached_count = 0;
 
     loop {
-        if cached_count % 10 == 0 {
-            scan_pb.set_message(format!(
-                "{} already hashed files, {} to hash",
-                cached_count, sent_count
-            ));
-        }
-        if sent_count % 10 == 0 {
-            scan_pb.set_message(format!(
-                "{} already hashed files, {} to hash",
-                cached_count, sent_count
-            ));
-        }
-
         let file = match scanned_files_rx.try_recv() {
             Ok(file) => file,
             Err(mpsc::error::TryRecvError::Empty) => {
@@ -176,6 +163,11 @@ pub async fn filter_files(
             sent_count += 1;
             hash_pb.set_length(sent_count as u64);
         }
+
+        scan_pb.set_message(format!(
+            "{} already hashed files, {} to hash",
+            cached_count, sent_count
+        ));
     }
 
     scan_pb.finish_with_message(format!(
