@@ -247,10 +247,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
-      - name: Setup cache
-        id: cache
+      - name: Restore cache
+        id: restore-cache
         continue-on-error: true
-        uses: actions/cache@v5
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/.cargo
