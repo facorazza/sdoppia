@@ -17,7 +17,7 @@ use db::{
 use error::Result;
 use models::{FileMetadata, HashedFile};
 
-const QUEUE_SIZE: usize = 100000;
+const QUEUE_SIZE: usize = 1000;
 
 #[tokio::main]
 async fn main() -> Result<()> {
