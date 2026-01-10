@@ -126,7 +126,7 @@ pub async fn filter_files(
     mut scanned_files_rx: mpsc::Receiver<FileMetadata>,
     filtered_files_tx: mpsc::Sender<FileMetadata>,
     rehash: bool,
-    filter_pb: ProgressBar,
+    scan_pb: ProgressBar,
     hash_pb: ProgressBar,
 ) -> Result<usize> {
     let mut sent_count = 0;
@@ -134,10 +134,16 @@ pub async fn filter_files(
 
     loop {
         if cached_count % 10 == 0 {
-            filter_pb.set_message(format!("✓ {} cached, {} to hash", cached_count, sent_count));
+            scan_pb.set_message(format!(
+                "{} already hashed files, {} to hash",
+                cached_count, sent_count
+            ));
         }
         if sent_count % 10 == 0 {
-            filter_pb.set_message(format!("✓ {} cached, {} to hash", cached_count, sent_count));
+            scan_pb.set_message(format!(
+                "{} already hashed files, {} to hash",
+                cached_count, sent_count
+            ));
         }
 
         let file = match scanned_files_rx.try_recv() {
@@ -173,7 +179,7 @@ pub async fn filter_files(
         }
     }
 
-    filter_pb.finish_with_message(format!(
+    scan_pb.finish_with_message(format!(
         "Cached: {}, Need hashing: {}",
         cached_count, sent_count
     ));

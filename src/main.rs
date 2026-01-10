@@ -66,43 +66,32 @@ async fn main() -> Result<()> {
             let scan_pb = multi_progress_bar.add(ProgressBar::new_spinner());
             scan_pb.set_style(
                 ProgressStyle::default_spinner()
-                    .template("{spinner:.green} [{elapsed_precise}] Scan: {msg}")
+                    .template("{spinner:.green} [{elapsed_precise}] Scanning files: {msg}")
                     .unwrap()
                     .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
             );
             scan_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-            let filter_pb = multi_progress_bar.add(ProgressBar::new_spinner());
-            filter_pb.set_style(
-                ProgressStyle::default_spinner()
-                    .template("{spinner:.blue} [{elapsed_precise}] Filter: {msg}")
-                    .unwrap()
-                    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
-            );
-            filter_pb.enable_steady_tick(std::time::Duration::from_millis(100));
-
             let hash_pb = multi_progress_bar.add(ProgressBar::new(0));
             hash_pb.set_style(
                 ProgressStyle::default_bar()
-                    .template("{spinner:.cyan} [{elapsed_precise}] Hash: [{bar:40.cyan/blue}] {pos}/{len} {percent}% ({per_sec}, ETA: {eta}) {msg}")
+                    .template("{spinner:.cyan} [{elapsed_precise}] Hashing files: [{bar:40.cyan/blue}] {pos}/{len} {percent}% ({per_sec}, ETA: {eta}) {msg}")
                     .unwrap()
                     .progress_chars("█▉▊▋▌▍▎▏  ")
                     .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
             );
-            hash_pb.set_message("Hashing files");
             hash_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
             let db_pb = multi_progress_bar.add(ProgressBar::new(0));
             db_pb.set_style(
                 ProgressStyle::default_bar()
                     .template(
-                        "{spinner:.yellow} [{elapsed_precise}] DB: [{bar:40.yellow/blue}] {pos}/{len} {percent}% ({per_sec}) {msg}",
+                        "{spinner:.yellow} [{elapsed_precise}] Writing to database: [{bar:40.yellow/blue}] {pos}/{len} {percent}% ({per_sec}) {msg}",
                     )
                     .unwrap()
                     .progress_chars("█▉▊▋▌▍▎▏  ")
                     .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
             );
-            db_pb.set_message("Writing to database");
             db_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
             // Spawn channels
@@ -115,12 +104,10 @@ async fn main() -> Result<()> {
             let (hashed_files_tx, hashed_files_rx) = mpsc::channel::<HashedFile>(QUEUE_SIZE);
 
             // Spawn tasks
-            let filter_pb_clone = filter_pb.clone();
-            let hash_pb_clone = hash_pb.clone();
+            let scan_pb_clone = scan_pb.clone();
             let scan_handle = tokio::spawn(async move {
-                match fs::scan(paths, follow_links, &scanned_files_tx, &scan_pb).await {
+                match fs::scan(paths, follow_links, &scanned_files_tx, scan_pb_clone).await {
                     Ok(count) => {
-                        filter_pb_clone.set_length(count as u64);
                         drop(scanned_files_tx);
                         Ok(count)
                     }
@@ -128,12 +115,14 @@ async fn main() -> Result<()> {
                 }
             });
 
+            let scan_pb_clone = scan_pb.clone();
+            let hash_pb_clone = hash_pb.clone();
             let filter_handle = tokio::spawn(filter_files(
                 pool.clone(),
                 scanned_files_rx,
                 filtered_files_tx,
                 rehash,
-                filter_pb.clone(),
+                scan_pb_clone,
                 hash_pb_clone,
             ));
 

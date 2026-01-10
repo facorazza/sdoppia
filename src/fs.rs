@@ -17,7 +17,7 @@ pub async fn scan(
     paths: Vec<PathBuf>,
     follow_links: bool,
     fs_scanner_tx: &mpsc::Sender<FileMetadata>,
-    scan_pb: &ProgressBar,
+    scan_pb: ProgressBar,
     // shutdown: Arc<tokio::sync::Notify>,
 ) -> Result<usize> {
     let mut file_count = 0;
@@ -37,7 +37,6 @@ pub async fn scan(
         if path.is_file() {
             send_file(fs_scanner_tx, path).await?;
             file_count += 1;
-            scan_pb.set_message(format!("✓ Scanned 1 file: {}", path.display()));
         } else if path.is_dir() {
             for entry in WalkDir::new(path)
                 .follow_links(follow_links)
