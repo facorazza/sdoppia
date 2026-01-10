@@ -76,33 +76,15 @@ pub async fn database_writer(
     let mut total_inserted = 0;
 
     loop {
-        // Check for shutdown signal
-        if shutdown.load(Ordering::Relaxed) {
-            warn!("Database writer received shutdown signal");
-            // Flush any remaining data in buffer before exiting
-            if !buffer.is_empty() {
-                info!(
-                    "Flushing {} remaining records before shutdown",
-                    buffer.len()
-                );
-                match save_hashes(&pool, &buffer).await {
-                    Ok(count) => {
-                        total_inserted += count;
-                        db_pb.inc(count as u64);
-                    }
-                    Err(e) => {
-                        warn!("Final batch insert failed: {}", e);
-                    }
-                }
-            }
-            break;
-        }
-
+        let mut disconnected = false;
         loop {
             match rx.try_recv() {
                 Ok(file) => buffer.push(file),
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
             }
         }
 
@@ -117,6 +99,17 @@ pub async fn database_writer(
                 }
             }
             buffer.clear();
+        }
+
+        // Check for shutdown signal
+        if shutdown.load(Ordering::Relaxed) {
+            warn!("Database writer received shutdown signal");
+            break;
+        }
+
+        // Exit if channel is disconnected and buffer is flushed
+        if disconnected {
+            break;
         }
 
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
