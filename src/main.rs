@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
                     .unwrap()
                     .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
             );
-            scan_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+            scan_pb.enable_steady_tick(std::time::Duration::from_millis(30));
 
             let hash_pb = multi_progress_bar.add(ProgressBar::new(0));
             hash_pb.set_style(
@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
                     .progress_chars("█▉▊▋▌▍▎▏  ")
                     .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
             );
-            hash_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+            hash_pb.enable_steady_tick(std::time::Duration::from_millis(30));
 
             let db_pb = multi_progress_bar.add(ProgressBar::new(0));
             db_pb.set_style(
@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
                     .progress_chars("█▉▊▋▌▍▎▏  ")
                     .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
             );
-            db_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+            db_pb.enable_steady_tick(std::time::Duration::from_millis(30));
 
             // Spawn channels
             let (scanned_files_tx, scanned_files_rx) = mpsc::channel::<FileMetadata>(QUEUE_SIZE);
