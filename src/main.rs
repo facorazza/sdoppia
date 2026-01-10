@@ -200,6 +200,7 @@ async fn main() -> Result<()> {
         Commands::Clear { db } => {
             let pool = init_database(&db).await?;
             clear_database(&pool).await?;
+            pool.close().await;
         }
         Commands::Stats { db } => {
             let pool = init_database(&db).await?;
