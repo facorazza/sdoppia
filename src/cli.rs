@@ -6,8 +6,8 @@ const DATABASE_FILE: &str = "dedup.db";
 
 #[derive(Parser)]
 #[command(
-    author,
-    version,
+    author = env!("CARGO_PKG_AUTHORS"),
+    version = env!("CARGO_PKG_VERSION"),
     about = "Duplicate files finder",
     long_about = "A CLI tool to scan directories, hash files, and find duplicates"
 )]
