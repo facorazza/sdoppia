@@ -72,6 +72,8 @@ pub async fn scan(
 
                 send_file(fs_scanner_tx, entry.path()).await?;
                 file_count += 1;
+
+                scan_pb.set_message(format!("{} files", file_count));
             }
 
             info!(

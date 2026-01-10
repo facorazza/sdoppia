@@ -181,7 +181,6 @@ async fn main() -> Result<()> {
             for handle in hash_handles {
                 let _ = handle.await;
             }
-            info!("All files have been hashed");
 
             // Wait for database writer to flush all data
             info!("Saving hashes to database...");
