@@ -1,4 +1,4 @@
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
@@ -12,12 +12,12 @@ use walkdir::WalkDir;
 use crate::error::{DedupError, Result};
 use crate::models::{FileMetadata, HashedFile};
 
-#[instrument(skip(fs_scanner_tx, multi_progress))]
+#[instrument(skip(fs_scanner_tx, scan_pb))]
 pub async fn scan(
     paths: Vec<PathBuf>,
     follow_links: bool,
     fs_scanner_tx: &mpsc::Sender<FileMetadata>,
-    multi_progress: &MultiProgress,
+    scan_pb: &ProgressBar,
     // shutdown: Arc<tokio::sync::Notify>,
 ) -> Result<()> {
     let mut file_count = 0;
@@ -30,28 +30,14 @@ pub async fn scan(
             });
         }
 
-        let path_pb = multi_progress.add(ProgressBar::new_spinner());
-        path_pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.green} {msg}")
-                .unwrap()
-                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
-        );
-        path_pb.set_message(format!("Scanning: {}", path.display()));
+        if file_count % 10 == 0 {
+            scan_pb.set_message(format!("{} files", file_count));
+        }
 
         if path.is_file() {
             send_file(fs_scanner_tx, path).await?;
             file_count += 1;
         } else if path.is_dir() {
-            let dir_pb = multi_progress.add(ProgressBar::new_spinner());
-            dir_pb.set_style(
-                ProgressStyle::default_spinner()
-                    .template("{spinner:.green} {msg}")
-                    .unwrap()
-                    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
-            );
-            let start_count = file_count;
-
             for entry in WalkDir::new(path)
                 .follow_links(follow_links)
                 .into_iter()
@@ -64,22 +50,18 @@ pub async fn scan(
                 send_file(fs_scanner_tx, entry.path()).await?;
                 file_count += 1;
 
-                if file_count % 100 == 0 {
-                    dir_pb.set_message(format!(
-                        "{}: {} files",
-                        path.display(),
-                        file_count - start_count
-                    ));
+                if file_count % 10 == 0 {
+                    scan_pb.set_message(format!("{} files", file_count));
                 }
             }
 
-            dir_pb.finish_with_message(format!("✓ {}: {} files", path.display(), file_count - start_count));
             info!(
                 "Scanned {} files in directory: {}",
                 file_count,
                 path.display()
             );
         }
+        scan_pb.finish_with_message(format!("{} files", file_count));
     }
 
     Ok(())

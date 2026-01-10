@@ -2,7 +2,6 @@ use indicatif::{ProgressBar, ProgressStyle};
 use sqlx::Row;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;

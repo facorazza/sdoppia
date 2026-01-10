@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
 
             // Spawn tasks
             let scan_handle = tokio::spawn(async move {
-                fs::scan(paths, follow_links, &scanned_files_tx, &multi_progress_bar).await
+                fs::scan(paths, follow_links, &scanned_files_tx, &scan_pb).await
             });
 
             let filter_handle = tokio::spawn(filter_files(
