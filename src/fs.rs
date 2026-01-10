@@ -179,7 +179,7 @@ pub fn spawn_hash_workers(
 fn hash_file(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0; 65536];
+    let mut buffer = [0; 1 * 1024 * 1024]; // 1 MB buffer
 
     loop {
         let n = file.read(&mut buffer)?;
