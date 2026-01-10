@@ -5,7 +5,7 @@ use std::sync::{
 
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use tracing_subscriber::{self, EnvFilter};
 
 mod cli;
