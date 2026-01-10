@@ -66,34 +66,44 @@ async fn main() -> Result<()> {
             let scan_pb = multi_progress_bar.add(ProgressBar::new_spinner());
             scan_pb.set_style(
                 ProgressStyle::default_spinner()
-                    .template("{spinner:.green} {msg}")
-                    .unwrap(),
+                    .template("{spinner:.green} [{elapsed_precise}] Scan: {msg}")
+                    .unwrap()
+                    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
             );
+            scan_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
             let filter_pb = multi_progress_bar.add(ProgressBar::new_spinner());
             filter_pb.set_style(
                 ProgressStyle::default_spinner()
-                    .template("{spinner:.blue} {msg}")
-                    .unwrap(),
+                    .template("{spinner:.blue} [{elapsed_precise}] Filter: {msg}")
+                    .unwrap()
+                    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
             );
+            filter_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
             let hash_pb = Arc::new(multi_progress_bar.add(ProgressBar::new(0)));
             hash_pb.set_style(
                 ProgressStyle::default_bar()
-                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) {msg}")
+                    .template("{spinner:.cyan} [{elapsed_precise}] Hash: [{bar:40.cyan/blue}] {pos}/{len} {percent}% ({per_sec}, ETA: {eta}) {msg}")
                     .unwrap()
-                    .progress_chars("#>-")
+                    .progress_chars("█▉▊▋▌▍▎▏  ")
+                    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
             );
+            hash_pb.set_message("Hashing files");
+            hash_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
             let db_pb = multi_progress_bar.add(ProgressBar::new(0));
             db_pb.set_style(
                 ProgressStyle::default_bar()
                     .template(
-                        "{spinner:.yellow} [{elapsed_precise}] [{bar:40.yellow/blue}] {pos}/{len} {msg}",
+                        "{spinner:.yellow} [{elapsed_precise}] DB: [{bar:40.yellow/blue}] {pos}/{len} {percent}% ({per_sec}) {msg}",
                     )
                     .unwrap()
-                    .progress_chars("#>-"),
+                    .progress_chars("█▉▊▋▌▍▎▏  ")
+                    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
             );
+            db_pb.set_message("Writing to database");
+            db_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
             // Spawn channels
             let (scanned_files_tx, scanned_files_rx) = mpsc::channel::<FileMetadata>(QUEUE_SIZE);

@@ -41,9 +41,10 @@ pub async fn scan(
         path_pb.set_style(
             ProgressStyle::default_spinner()
                 .template("{spinner:.green} {msg}")
-                .unwrap(),
+                .unwrap()
+                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
         );
-        path_pb.set_message(format!("Scanning path: {}", path.display()));
+        path_pb.set_message(format!("Scanning: {}", path.display()));
 
         if path.is_file() {
             send_file(fs_scanner_tx, path).await?;
@@ -53,9 +54,10 @@ pub async fn scan(
             dir_pb.set_style(
                 ProgressStyle::default_spinner()
                     .template("{spinner:.green} {msg}")
-                    .unwrap(),
+                    .unwrap()
+                    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
             );
-            dir_pb.set_message(format!("Scanning directory: {}", path.display()));
+            let start_count = file_count;
 
             for entry in WalkDir::new(path)
                 .follow_links(follow_links)
@@ -68,9 +70,17 @@ pub async fn scan(
 
                 send_file(fs_scanner_tx, entry.path()).await?;
                 file_count += 1;
+                
+                if file_count % 100 == 0 {
+                    dir_pb.set_message(format!(
+                        "{}: {} files",
+                        path.display(),
+                        file_count - start_count
+                    ));
+                }
             }
 
-            dir_pb.finish_with_message(format!("Finished scanning directory: {}", path.display()));
+            dir_pb.finish_with_message(format!("✓ {}: {} files", path.display(), file_count - start_count));
             info!(
                 "Scanned {} files in directory: {}",
                 file_count,

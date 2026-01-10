@@ -122,50 +122,6 @@ async fn save_hashes(pool: &SqlitePool, files: &[HashedFile]) -> Result<usize> {
     Ok(files.len())
 }
 
-async fn get_existing_hashes(
-    pool: &SqlitePool,
-    paths: &[String],
-) -> Result<HashMap<String, HashedFile>> {
-    if paths.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let mut result = HashMap::new();
-
-    for chunk in paths.chunks(BATCH_SIZE) {
-        let placeholders = (0..chunk.len()).map(|_| "?").collect::<Vec<_>>().join(",");
-        let query = format!(
-            "SELECT path, hash, size, mtime FROM hashes WHERE path IN ({})",
-            placeholders
-        );
-
-        let mut q = sqlx::query(&query);
-        for path in chunk {
-            q = q.bind(path);
-        }
-
-        let rows = q.fetch_all(pool).await?;
-
-        for row in rows {
-            let path: String = row.get(0);
-            let hash: String = row.get(1);
-            let size: i64 = row.get(2);
-            let mtime: i64 = row.get(3);
-            result.insert(
-                path.clone(),
-                HashedFile {
-                    absolute_path: path.into(),
-                    size,
-                    mtime,
-                    hash,
-                },
-            );
-        }
-    }
-
-    Ok(result)
-}
-
 pub async fn filter_files(
     pool: SqlitePool,
     mut scanned_files_rx: mpsc::Receiver<FileMetadata>,
@@ -175,62 +131,44 @@ pub async fn filter_files(
 ) -> Result<usize> {
     let mut sent_count = 0;
     let mut cached_count = 0;
-    let mut batch = Vec::new();
-
-    filter_pb.set_message("Checking cache...");
 
     loop {
-        batch.clear();
-        loop {
-            match scanned_files_rx.try_recv() {
-                Ok(file) => batch.push(file),
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
-            }
+        if cached_count % 10 == 0 {
+            filter_pb.set_message(format!("✓ {} cached, {} to hash", cached_count, sent_count));
+        }
+        if sent_count % 10 == 0 {
+            filter_pb.set_message(format!("✓ {} cached, {} to hash", cached_count, sent_count));
         }
 
-        if batch.is_empty() {
-            if scanned_files_rx.is_closed() {
-                break;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            continue;
-        }
-
-        // Query database for cached hashes
-        let existing_hashes = if !rehash {
-            let paths: Vec<String> = batch
-                .iter()
-                .map(|f| f.absolute_path.to_string_lossy().to_string())
-                .collect();
-            get_existing_hashes(&pool, &paths).await?
-        } else {
-            HashMap::new()
-        };
-
-        // Filter and send files that need hashing
-        for file in batch.drain(..) {
-            if !rehash
-                && let Some(cached) =
-                    existing_hashes.get(&file.absolute_path.to_string_lossy().to_string())
-                && cached.size == file.size
-                && cached.mtime == file.mtime
-            {
-                cached_count += 1;
-                filter_pb.set_message(format!(
-                    "Cached: {}, Need hashing: {}",
-                    cached_count, sent_count
-                ));
+        let file = match scanned_files_rx.try_recv() {
+            Ok(file) => file,
+            Err(mpsc::error::TryRecvError::Empty) => {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                 continue;
             }
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+        };
 
-            if filtered_files_tx.send(file).await.is_ok() {
-                sent_count += 1;
-                filter_pb.set_message(format!(
-                    "Cached: {}, Need hashing: {}",
-                    cached_count, sent_count
-                ));
+        if !rehash {
+            match sqlx::query("SELECT id FROM hashes WHERE path IN (?)")
+                .bind(file.absolute_path.to_string_lossy())
+                .fetch_one(&pool)
+                .await
+            {
+                Ok(_) => {
+                    cached_count += 1;
+                    continue;
+                }
+                Err(sqlx::Error::RowNotFound) => (),
+                Err(e) => {
+                    warn!("Database query error: {}", e);
+                    continue;
+                }
             }
+        }
+
+        if filtered_files_tx.send(file).await.is_ok() {
+            sent_count += 1;
         }
     }
 
