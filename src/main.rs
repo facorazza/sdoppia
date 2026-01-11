@@ -20,7 +20,7 @@ use db::{
 use error::Result;
 use models::{FileMetadata, HashedFile};
 
-const QUEUE_SIZE: usize = 1000;
+const QUEUE_SIZE: usize = 100000;
 const PROGRESS_CHARS: &str = "█▉▊▋▌▍▎▏  ";
 const TICK_CHARS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
 
