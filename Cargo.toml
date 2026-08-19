@@ -15,8 +15,8 @@ crossbeam-channel = "0.5.13"
 dirs = "6.0.0"
 indicatif = { version = "0.18.3", features = ["rayon"] }
 rayon = "1.11.0"
-sha2 = "0.10.9"
-sqlx = { version = "0.8.6", features = ["runtime-tokio-native-tls", "sqlite"] }
+sha2 = "0.11"
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
 thiserror = "2.0.17"
 tokio = { version = "1.49.0", features = ["full"] }
 tracing = "0.1.44"
