@@ -1,10 +1,10 @@
 [package]
 name = "sdoppia"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 description = "A CLI tool to scan directories, hash files, and find duplicate files"
 license = "MIT"
-repository = "https://git.facorazza.com/facorazza/sdoppia"
+repository = "https://github.com/facorazza/sdoppia"
 keywords = ["duplicate", "deduplication", "hash", "files", "cli"]
 categories = ["command-line-utilities", "filesystem"]
 
