@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-const DATABASE_FILE: &str = "dedup.db";
+const DATABASE_FILE: &str = "sdoppia.db";
 
 #[derive(Parser)]
 #[command(

@@ -6,18 +6,18 @@ use std::{
 
 use tempfile::TempDir;
 
-fn dedup_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_dedup")
+fn sdoppia_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_sdoppia")
 }
 
 fn run(args: &[&str]) -> Output {
-    Command::new(dedup_bin())
+    Command::new(sdoppia_bin())
         .args(args)
         // The binary's tracing filter honors RUST_LOG; keep test output
         // deterministic regardless of the caller's environment.
         .env_remove("RUST_LOG")
         .output()
-        .expect("failed to run dedup binary")
+        .expect("failed to run sdoppia binary")
 }
 
 fn stdout(output: &Output) -> String {

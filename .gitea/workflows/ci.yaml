@@ -18,7 +18,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  APP_NAME: dedup
+  APP_NAME: sdoppia
 
 jobs:
   lint:
@@ -109,6 +109,21 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ gitea.repository }}-${{ gitea.ref_name }}
 
+  publish-crates-io:
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
+
   publish-binary:
     runs-on: ubuntu-latest
     needs: test
@@ -185,6 +200,10 @@ jobs:
         run: |
           cargo publish --registry gitea --allow-dirty
 
+      - name: Build release binary
+        if: github.ref_type == 'tag'
+        run: cargo build --release
+
       - name: Store cache
         id: store-cache
         if: success() || failure()
@@ -202,16 +221,18 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RUNNER_TOKEN }}
         with:
           tag_name: v${{ steps.get_version.outputs.VERSION }}
-          release_name: Rust Library ${{ steps.get_version.outputs.VERSION }}
+          release_name: sdoppia ${{ steps.get_version.outputs.VERSION }}
           body: |
             ## Changes in ${{ steps.get_version.outputs.VERSION }}
 
-            ### Installation
+            ### Binary
 
-            Add to your `Cargo.toml`:
-            ```toml
-            [dependencies]
-            ${APP_NAME} = { version = "${{ steps.get_version.outputs.VERSION }}", registry = "gitea" }
+            Download the prebuilt `sdoppia` binary attached to this release.
+
+            ### Install from crates.io
+
+            ```sh
+            cargo install sdoppia
             ```
 
             ### Usage
@@ -219,3 +240,19 @@ jobs:
             See [README.md](https://git.facorazza.com/facorazza/${APP_NAME}) for usage instructions.
           draft: false
           prerelease: ${{ contains(steps.get_version.outputs.VERSION, 'alpha') || contains(steps.get_version.outputs.VERSION, 'beta') || contains(steps.get_version.outputs.VERSION, 'rc') }}
+
+      - name: Attach binary to release
+        if: github.ref_type == 'tag'
+        env:
+          GITHUB_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+        run: |
+          RELEASE_ID=$(curl -s \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            "https://git.facorazza.com/api/v1/repos/${GITHUB_REPOSITORY}/releases/tags/v${{ steps.get_version.outputs.VERSION }}" \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+          curl -s \
+            -X POST \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            -F "attachment=@target/release/${APP_NAME}" \
+            "https://git.facorazza.com/api/v1/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets" \
+            -o /dev/null -w "Attached binary to release %{http_code}\n"
