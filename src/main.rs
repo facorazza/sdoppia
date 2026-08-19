@@ -20,12 +20,22 @@ use db::{
 use error::Result;
 use models::{FileMetadata, HashedFile};
 
-const QUEUE_SIZE: usize = 100000;
+// Channel capacity per pipeline stage. Producers block (scanner in a
+// blocking thread, filter via try_send retry) when full, so this only
+// needs to absorb bursts, not hold the whole workload in memory.
+const QUEUE_SIZE: usize = 4096;
 const PROGRESS_CHARS: &str = "█▉▊▋▌▍▎▏  ";
 const TICK_CHARS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     let filter = if cli.verbose {
@@ -114,22 +124,16 @@ async fn main() -> Result<()> {
             // Spawn tasks
             let scan_pb_clone = scan_pb.clone();
             let shutdown_clone = Arc::clone(&shutdown);
-            let scan_handle = tokio::spawn(async move {
-                match fs::scan(
+            // The scanner does blocking filesystem I/O and blocking channel
+            // sends, so run it on the blocking thread pool.
+            let scan_handle = tokio::task::spawn_blocking(move || {
+                fs::scan(
                     paths,
                     follow_links,
                     &scanned_files_tx,
                     scan_pb_clone,
                     shutdown_clone,
                 )
-                .await
-                {
-                    Ok(count) => {
-                        drop(scanned_files_tx);
-                        Ok(count)
-                    }
-                    Err(e) => Err(e),
-                }
             });
 
             let scan_pb_clone = scan_pb.clone();
@@ -170,11 +174,11 @@ async fn main() -> Result<()> {
             ));
 
             // Wait for scanner to finish
-            let _ = scan_handle.await;
+            let scan_result = scan_handle.await;
             debug!("Scanner finished");
 
             // Wait for filter to finish processing scanned files
-            let _ = filter_handle.await;
+            let filter_result = filter_handle.await;
             debug!("Filter finished");
 
             // Drop filtered_files_tx to signal hash workers no more files are coming
@@ -192,7 +196,17 @@ async fn main() -> Result<()> {
 
             // Wait for database writer to flush all data
             debug!("Saving hashes to database...");
-            let _ = db_writer_handle.await;
+            let db_result = db_writer_handle.await;
+
+            // Propagate errors from the pipeline stages now that everything
+            // has drained. A failed scan must not look like a successful run.
+            let scanned = scan_result??;
+            let filtered = filter_result??;
+            let written = db_result??;
+            debug!(
+                "Scanned {} files, hashed {}, wrote {}",
+                scanned, filtered, written
+            );
 
             export_duplicates(&pool, output.as_deref(), min_size).await?;
             pool.close().await;

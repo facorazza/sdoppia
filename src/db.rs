@@ -187,10 +187,28 @@ pub async fn filter_files(
             }
         }
 
-        if filtered_files_tx.send(file).is_ok() {
-            sent_count += 1;
-            hash_pb.set_length(sent_count as u64);
+        // Send without blocking the async runtime: if the hash workers are
+        // behind, yield briefly and retry until space frees up or shutdown.
+        let mut file = file;
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                return Ok(sent_count);
+            }
+            match filtered_files_tx.try_send(file) {
+                Ok(()) => {
+                    sent_count += 1;
+                    break;
+                }
+                Err(crossbeam_channel::TrySendError::Full(f)) => {
+                    file = f;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    return Ok(sent_count);
+                }
+            }
         }
+        hash_pb.set_length(sent_count as u64);
 
         scan_pb.set_message(format!(
             "{} already hashed files, {} to hash",
@@ -250,6 +268,21 @@ pub async fn export_duplicates(
 
     if hash_rows.is_empty() {
         pb.finish_with_message("No duplicates found!");
+        // Still write the report so an explicitly requested output file is
+        // always produced, even when there is nothing to report.
+        let output_text = format!(
+            "=== DUPLICATE FILES REPORT ===\nGenerated: {}\nTotal duplicate files: 0\nWasted space: 0 bytes\nDuplicate groups: 0\n",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        );
+        if let Some(output_path) = output {
+            let file = File::create(output_path)?;
+            let mut writer = BufWriter::new(file);
+            writer.write_all(output_text.as_bytes())?;
+            writer.flush()?;
+            info!("Duplicates exported to: {}", output_path.display());
+        } else {
+            println!("{}", output_text);
+        }
         return Ok(());
     }
 
@@ -370,15 +403,15 @@ pub async fn show_stats(pool: &SqlitePool) -> Result<()> {
     .fetch_one(pool)
     .await?;
 
-    info!("=== DATABASE STATISTICS ===");
-    info!("Total files: {}", total_files);
-    info!("Total size: {}", Duplicates::format_size(total_size));
-    info!("Duplicate files: {}", duplicate_files);
-    info!("Wasted space: {}", Duplicates::format_size(wasted_space));
+    println!("=== DATABASE STATISTICS ===");
+    println!("Total files: {}", total_files);
+    println!("Total size: {}", Duplicates::format_size(total_size));
+    println!("Duplicate files: {}", duplicate_files);
+    println!("Wasted space: {}", Duplicates::format_size(wasted_space));
 
     if total_files > 0 {
         let duplicate_percentage = (duplicate_files as f64 / total_files as f64) * 100.0;
-        info!("Duplicate percentage: {:.2}%", duplicate_percentage);
+        println!("Duplicate percentage: {:.2}%", duplicate_percentage);
     }
 
     Ok(())

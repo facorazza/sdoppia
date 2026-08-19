@@ -44,3 +44,50 @@ impl Duplicates {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_size_bytes() {
+        assert_eq!(Duplicates::format_size(0), "0 bytes");
+        assert_eq!(Duplicates::format_size(1023), "1023 bytes");
+    }
+
+    #[test]
+    fn format_size_kb() {
+        assert_eq!(Duplicates::format_size(1024), "1.00 KB");
+        assert_eq!(Duplicates::format_size(2048), "2.00 KB");
+    }
+
+    #[test]
+    fn format_size_mb() {
+        assert_eq!(Duplicates::format_size(5 * 1024 * 1024), "5.00 MB");
+    }
+
+    #[test]
+    fn format_size_gb() {
+        assert_eq!(Duplicates::format_size(3 * 1024 * 1024 * 1024), "3.00 GB");
+    }
+
+    #[test]
+    fn wasted_space_counts_all_but_one_copy() {
+        let group = Duplicates {
+            hash: "abc".to_string(),
+            size: 100,
+            files: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        };
+        assert_eq!(group.wasted_space(), 200);
+    }
+
+    #[test]
+    fn wasted_space_single_file_is_zero() {
+        let group = Duplicates {
+            hash: "abc".to_string(),
+            size: 100,
+            files: vec!["a".to_string()],
+        };
+        assert_eq!(group.wasted_space(), 0);
+    }
+}

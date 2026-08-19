@@ -346,6 +346,7 @@ dependencies = [
  "rayon",
  "sha2",
  "sqlx",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

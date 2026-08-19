@@ -29,6 +29,9 @@ pub enum DedupError {
     #[error("Channel closed unexpectedly")]
     ChannelClosed,
 
+    #[error("Background task failed: {0}")]
+    TaskJoin(#[from] tokio::task::JoinError),
+
     #[error("Database operation failed: {0}")]
     Database(#[from] sqlx::Error),
 
