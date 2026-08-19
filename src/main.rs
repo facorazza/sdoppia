@@ -109,7 +109,7 @@ async fn run() -> Result<()> {
             );
             db_pb.enable_steady_tick(std::time::Duration::from_millis(30));
 
-            // Spawn channels - all using crossbeam
+            // Spawn channels, all using crossbeam
             let (scanned_files_tx, scanned_files_rx) =
                 crossbeam_channel::bounded::<FileMetadata>(QUEUE_SIZE);
 
