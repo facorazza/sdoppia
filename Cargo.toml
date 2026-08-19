@@ -13,12 +13,12 @@ chrono = "0.4.42"
 clap = { version = "4.5.54", features = ["derive"] }
 crossbeam-channel = "0.5.13"
 dirs = "6.0.0"
-indicatif = { version = "0.18.3", features = ["rayon"] }
+indicatif = "0.18.3"
 rayon = "1.11.0"
 sha2 = "0.11"
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
 thiserror = "2.0.17"
-tokio = { version = "1.49.0", features = ["full"] }
+tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 walkdir = "2.5.0"
