@@ -2,7 +2,7 @@
 
 A CLI tool to scan directories, hash files, and find duplicate files.
 
-`sdoppia` (Italian: "un-duplicate") walks one or more directories, SHA-256
+`sdoppia` walks one or more directories, SHA-256
 hashes every file, stores the results in a local SQLite database, and reports
 duplicate groups with the space they waste. On rescan, unchanged files (same
 size and modification time) are skipped using cached hashes, so repeat scans
