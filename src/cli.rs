@@ -4,6 +4,15 @@ use clap::{Parser, Subcommand};
 
 const DATABASE_FILE: &str = "sdoppia.db";
 
+/// Default database location: the per-OS data directory (XDG data home on
+/// Linux, ~/Library/Application Support on macOS, %LOCALAPPDATA% on Windows).
+pub fn default_db_path() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("sdoppia")
+        .join(DATABASE_FILE)
+}
+
 #[derive(Parser)]
 #[command(
     author = env!("CARGO_PKG_AUTHORS"),
@@ -28,9 +37,9 @@ pub enum Commands {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
 
-        /// Database file path
-        #[arg(short, long, default_value = DATABASE_FILE)]
-        db: PathBuf,
+        /// Database file path (default: per-OS data directory, e.g. ~/.local/share/sdoppia/sdoppia.db)
+        #[arg(short, long)]
+        db: Option<PathBuf>,
 
         /// Follow symbolic links
         #[arg(short = 'L', long)]
@@ -50,14 +59,14 @@ pub enum Commands {
     },
     /// Clear all entries from the database
     Clear {
-        /// Database file path
-        #[arg(short, long, default_value = DATABASE_FILE)]
-        db: PathBuf,
+        /// Database file path (default: per-OS data directory, e.g. ~/.local/share/sdoppia/sdoppia.db)
+        #[arg(short, long)]
+        db: Option<PathBuf>,
     },
     /// Show database statistics
     Stats {
-        /// Database file path
-        #[arg(short, long, default_value = DATABASE_FILE)]
-        db: PathBuf,
+        /// Database file path (default: per-OS data directory, e.g. ~/.local/share/sdoppia/sdoppia.db)
+        #[arg(short, long)]
+        db: Option<PathBuf>,
     },
 }

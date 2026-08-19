@@ -47,12 +47,16 @@ Arguments:
   <PATHS>...  Directories to scan (can specify multiple)
 
 Options:
-  -d, --db <DB>              Database file path [default: sdoppia.db]
+  -d, --db <DB>              Database file path (default: per-OS data directory, e.g. ~/.local/share/sdoppia/sdoppia.db)
   -L, --follow-links         Follow symbolic links
   -r, --rehash               Force rehashing of files already in database
   -o, --output <OUTPUT>      Output file for duplicates (optional, prints to stdout if not provided)
   -m, --min-size <MIN_SIZE>  Minimum file size in bytes to include in export [default: 0]
 ```
+
+The database lives in the per-OS data directory by default: `~/.local/share/sdoppia/sdoppia.db`
+on Linux, `~/Library/Application Support/sdoppia/sdoppia.db` on macOS, and
+`%LOCALAPPDATA%\sdoppia\sdoppia.db` on Windows. Pass `--db` to use a custom location.
 
 ## Examples
 
@@ -86,7 +90,7 @@ Follow symbolic links while scanning:
 sdoppia scan ~/Documents --follow-links
 ```
 
-Use a custom database file (default is `sdoppia.db` in the current directory):
+Use a custom database file (default is the per-OS data directory, see above):
 
 ```sh
 sdoppia scan ~/Documents --db /path/to/sdoppia.db

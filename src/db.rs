@@ -21,6 +21,10 @@ use crate::{
 
 #[instrument(skip(db_path))]
 pub async fn init_database(db_path: &Path) -> Result<SqlitePool> {
+    if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+
     let db_url = format!("sqlite:{}", db_path.display());
     debug!("Connecting to database: {}", db_url);
 

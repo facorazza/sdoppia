@@ -13,7 +13,7 @@ mod db;
 mod error;
 mod fs;
 mod models;
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, default_db_path};
 use db::{
     clear_database, database_writer, export_duplicates, filter_files, init_database, show_stats,
 };
@@ -74,7 +74,8 @@ async fn run() -> Result<()> {
             output,
             min_size,
         } => {
-            let pool = init_database(&db).await?;
+            let db_path = db.unwrap_or_else(default_db_path);
+            let pool = init_database(&db_path).await?;
             let multi_progress_bar = MultiProgress::new();
 
             // Create progress bars
@@ -212,12 +213,14 @@ async fn run() -> Result<()> {
             pool.close().await;
         }
         Commands::Clear { db } => {
-            let pool = init_database(&db).await?;
+            let db_path = db.unwrap_or_else(default_db_path);
+            let pool = init_database(&db_path).await?;
             clear_database(&pool).await?;
             pool.close().await;
         }
         Commands::Stats { db } => {
-            let pool = init_database(&db).await?;
+            let db_path = db.unwrap_or_else(default_db_path);
+            let pool = init_database(&db_path).await?;
             show_stats(&pool).await?;
             pool.close().await;
         }

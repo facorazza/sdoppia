@@ -12,6 +12,7 @@ categories = ["command-line-utilities", "filesystem"]
 chrono = "0.4.42"
 clap = { version = "4.5.54", features = ["derive"] }
 crossbeam-channel = "0.5.13"
+dirs = "6.0.0"
 indicatif = { version = "0.18.3", features = ["rayon"] }
 rayon = "1.11.0"
 sha2 = "0.10.9"
