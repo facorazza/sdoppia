@@ -201,7 +201,7 @@ pub async fn filter_files(
     scanned_files_rx: Receiver<FileMetadata>,
     filtered_files_tx: Sender<FileMetadata>,
     rehash: bool,
-    scan_pb: ProgressBar,
+    filter_pb: ProgressBar,
     hash_pb: ProgressBar,
     shutdown: Arc<AtomicBool>,
 ) -> Result<usize> {
@@ -261,7 +261,7 @@ pub async fn filter_files(
         let mut file = file;
         loop {
             if shutdown.load(Ordering::Relaxed) {
-                scan_pb.finish_with_message(format!(
+                filter_pb.finish_with_message(format!(
                     "⚠ Interrupted: Cached: {}, Need hashing: {}",
                     cached_count, sent_count
                 ));
@@ -283,13 +283,13 @@ pub async fn filter_files(
         }
         hash_pb.set_length(sent_count as u64);
 
-        scan_pb.set_message(format!(
+        filter_pb.set_message(format!(
             "{} already hashed files, {} to hash",
             cached_count, sent_count
         ));
     }
 
-    scan_pb.finish_with_message(format!(
+    filter_pb.finish_with_message(format!(
         "Cached: {}, Need hashing: {}",
         cached_count, sent_count
     ));

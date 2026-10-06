@@ -104,6 +104,15 @@ async fn run() -> Result<()> {
             );
             scan_pb.enable_steady_tick(std::time::Duration::from_millis(30));
 
+            let filter_pb = multi_progress_bar.add(ProgressBar::new_spinner());
+            filter_pb.set_style(
+                ProgressStyle::default_spinner()
+                    .template("{spinner:.magenta} Checking cache: {msg}")
+                    .unwrap()
+                    .tick_chars(TICK_CHARS),
+            );
+            filter_pb.enable_steady_tick(std::time::Duration::from_millis(30));
+
             let hash_pb = multi_progress_bar.add(ProgressBar::new(0));
             hash_pb.set_style(
                 ProgressStyle::default_bar()
@@ -153,7 +162,7 @@ async fn run() -> Result<()> {
                 )
             });
 
-            let scan_pb_clone = scan_pb.clone();
+            let filter_pb_clone = filter_pb.clone();
             let hash_pb_clone = hash_pb.clone();
             let shutdown_clone = Arc::clone(&shutdown);
             let filtered_files_tx_clone = filtered_files_tx.clone();
@@ -162,7 +171,7 @@ async fn run() -> Result<()> {
                 scanned_files_rx,
                 filtered_files_tx_clone,
                 rehash,
-                scan_pb_clone,
+                filter_pb_clone,
                 hash_pb_clone,
                 shutdown_clone,
             ));
