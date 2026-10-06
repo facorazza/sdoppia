@@ -16,7 +16,7 @@ dirs = "7.0.0"
 indicatif = "0.18"
 rayon = "1.12"
 sha2 = "0.11"
-sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate"] }
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1"

@@ -11,13 +11,19 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender};
 use indicatif::{ProgressBar, ProgressStyle};
-use sqlx::{AssertSqlSafe, Row, SqlitePool, sqlite::SqliteConnectOptions};
+use sqlx::{
+    AssertSqlSafe, Row, SqlitePool,
+    migrate::Migrator,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
+};
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
     error::{DedupError, Result},
     models::{Duplicates, FileMetadata, HashedFile},
 };
+
+static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 #[instrument(skip(db_path))]
 pub async fn init_database(db_path: &Path) -> Result<SqlitePool> {
@@ -30,95 +36,25 @@ pub async fn init_database(db_path: &Path) -> Result<SqlitePool> {
 
     let options = SqliteConnectOptions::from_str(&db_url)?
         .create_if_missing(true)
-        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .pragma("cache_size", "-64000")
+        .pragma("temp_store", "MEMORY");
 
     let pool = SqlitePool::connect_with(options).await?;
 
-    sqlx::query("PRAGMA synchronous = NORMAL")
-        .execute(&pool)
-        .await?;
-    sqlx::query("PRAGMA cache_size = -64000")
-        .execute(&pool)
-        .await?;
-    sqlx::query("PRAGMA temp_store = MEMORY")
-        .execute(&pool)
-        .await?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS hashes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            path TEXT NOT NULL UNIQUE,
-            hash TEXT NOT NULL,
-            size INTEGER NOT NULL,
-            mtime INTEGER NOT NULL,
-            dev INTEGER NOT NULL DEFAULT 0,
-            ino INTEGER NOT NULL DEFAULT 0
-        )
-        "#,
-    )
-    .execute(&pool)
-    .await?;
-
-    // Databases created before hard-link detection have no dev/ino columns.
-    // Existing rows keep the default of 0, which reads as "unknown identity"
-    // and makes them count as individual copies, exactly as they did before.
-    add_missing_columns(
-        &pool,
-        &[
-            (
-                "dev",
-                "ALTER TABLE hashes ADD COLUMN dev INTEGER NOT NULL DEFAULT 0",
-            ),
-            (
-                "ino",
-                "ALTER TABLE hashes ADD COLUMN ino INTEGER NOT NULL DEFAULT 0",
-            ),
-        ],
-    )
-    .await?;
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_hash ON hashes(hash)")
-        .execute(&pool)
-        .await?;
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_size ON hashes(size)")
-        .execute(&pool)
-        .await?;
+    MIGRATOR.run(&pool).await?;
 
     debug!("Database initialized successfully");
     Ok(pool)
 }
 
-/// Idempotently add columns that older databases predate.
-///
-/// `table` is intentionally not a parameter: it is interpolated into the
-/// `PRAGMA` below, and hardcoding it keeps that statement a literal.
-async fn add_missing_columns(pool: &SqlitePool, columns: &[(&str, &'static str)]) -> Result<()> {
-    let existing: Vec<String> = sqlx::query("PRAGMA table_info(hashes)")
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .map(|row| row.get::<String, _>("name"))
-        .collect();
-
-    for (name, ddl) in columns {
-        if !existing.iter().any(|c| c == name) {
-            debug!("Adding column {name} to hashes");
-            sqlx::query(*ddl).execute(pool).await?;
-        }
-    }
-
-    Ok(())
-}
-
 /// SQL expression identifying the filesystem object a row refers to.
 ///
-/// Hard links and symbolic links share an inode, so rows with the same
-/// expression are one object reached by several paths. When the identity is
-/// unknown (`ino = 0`, covering pre-migration rows and platforms without inode
-/// data) the path stands in, so those rows keep counting individually instead
-/// of collapsing into one.
+/// Hard links and symbolic links share an inode, so rows with the same expression
+/// are one object reached by several paths. Where the identity is unknown
+/// (`ino = 0`, meaning the platform does not expose inode data) the path stands
+/// in, so those rows keep counting individually instead of collapsing into one.
 const IDENTITY_EXPR: &str =
     "CASE WHEN ino = 0 THEN 'p:' || path ELSE 'i:' || dev || ':' || ino END";
 

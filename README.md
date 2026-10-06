@@ -12,19 +12,19 @@ are fast.
 
 From crates.io:
 
-```sh
+```shell
 cargo install sdoppia
 ```
 
 Or from source:
 
-```sh
+```shell
 cargo install --path .
 ```
 
 ## Usage
 
-```
+```shell
 sdoppia [OPTIONS] <COMMAND>
 
 Commands:
@@ -40,7 +40,7 @@ Options:
 
 ### Scan
 
-```
+```shell
 sdoppia scan [OPTIONS] <PATHS>...
 
 Arguments:
@@ -62,55 +62,55 @@ on Linux, `~/Library/Application Support/sdoppia/sdoppia.db` on macOS, and
 
 Scan a directory and print the duplicate report to stdout:
 
-```sh
+```shell
 sdoppia scan ~/Documents
 ```
 
 Scan multiple paths and write the report to a file:
 
-```sh
+```shell
 sdoppia scan ~/Documents ~/Downloads --output duplicates.txt
 ```
 
 Only report duplicates larger than 1 MB:
 
-```sh
+```shell
 sdoppia scan ~/Documents --min-size 1048576
 ```
 
 Force rehashing of files already in the database:
 
-```sh
+```shell
 sdoppia scan ~/Documents --rehash
 ```
 
 Follow symbolic links while scanning:
 
-```sh
+```shell
 sdoppia scan ~/Documents --follow-links
 ```
 
 Use a custom database file (default is the per-OS data directory, see above):
 
-```sh
+```shell
 sdoppia scan ~/Documents --db /path/to/sdoppia.db
 ```
 
 Show database statistics:
 
-```sh
+```shell
 sdoppia stats
 ```
 
 Clear all entries from the database:
 
-```sh
+```shell
 sdoppia clear
 ```
 
 ## Example report
 
-```
+```shell
 === DUPLICATE FILES REPORT ===
 Generated: 2026-08-19 21:30:00
 Total duplicate files: 1
@@ -173,8 +173,17 @@ partially saved scan never looks like a clean one.
 
 ## Development
 
-```sh
+```shell
 cargo test          # unit and CLI integration tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+## Contributing
+
+Contributions are welcome! Please fork the repository and submit pull requests.
+Before submitting, make sure your code passes the tests and follows the coding standards.
+
+## License
+
+MIT

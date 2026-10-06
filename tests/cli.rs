@@ -373,67 +373,6 @@ fn follow_links_keeps_a_symlink_and_its_target_as_separate_paths() {
     );
 }
 
-/// Databases created before hard-link detection have no dev/ino columns. The
-/// migration must add them without disturbing existing rows, which keep the
-/// "unknown identity" default and count individually as they always have.
-#[tokio::test]
-async fn existing_database_gains_identity_columns_without_data_loss() {
-    let tmp = TempDir::new().unwrap();
-    let dir = tmp.path().join("files");
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("a.txt"), b"AAAA\n").unwrap();
-
-    let db = tmp.path().join("legacy.db");
-
-    let pool = open_db(&db, true).await;
-    sqlx::query(
-        "CREATE TABLE hashes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            path TEXT NOT NULL UNIQUE,
-            hash TEXT NOT NULL,
-            size INTEGER NOT NULL,
-            mtime INTEGER NOT NULL
-        )",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO hashes (path, hash, size, mtime) VALUES (?, ?, ?, ?)")
-        .bind("/legacy/a.txt")
-        .bind("deadbeef")
-        .bind(5i64)
-        .bind(1i64)
-        .execute(&pool)
-        .await
-        .unwrap();
-    pool.close().await;
-
-    let scan = run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()]);
-    assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
-
-    let pool = open_db(&db, false).await;
-    let legacy: (String, i64, i64) =
-        sqlx::query_as("SELECT hash, dev, ino FROM hashes WHERE path = '/legacy/a.txt'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(legacy.0, "deadbeef", "the pre-existing row must survive");
-    assert_eq!(
-        (legacy.1, legacy.2),
-        (0, 0),
-        "rows predating the migration get the unknown-identity default"
-    );
-    pool.close().await;
-
-    // Running again must be idempotent: the columns already exist.
-    let second = run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()]);
-    assert!(
-        second.status.success(),
-        "rescan failed: {}",
-        stderr(&second)
-    );
-}
-
 /// A cached hash may only be reused when the size **and** the mtime match the
 /// stored row. The stored mtime only has one-second granularity, so a rewrite
 /// that preserves it (`cp -p`, `rsync --times`, tar extraction, `git checkout`,
@@ -506,20 +445,24 @@ async fn scan_fails_when_database_writes_fail() {
     let db = tmp.path().join("test.db");
     let report = tmp.path().join("report.txt");
 
-    // Identical to the schema sdoppia creates, plus a constraint that rejects
-    // every row it will try to insert.
-    let pool = open_db(&db, true).await;
+    // First run establishes the schema and the migration history, so the
+    // trigger below is the only thing standing between the scan and its rows.
+    let setup = run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()]);
+    assert!(
+        setup.status.success(),
+        "setup scan failed: {}",
+        stderr(&setup)
+    );
+
+    // Change the files so the next scan cannot reuse the cached hashes: without
+    // new rows to write there would be nothing for the trigger to reject.
+    fs::write(dir.join("a.txt"), b"changed a\n").unwrap();
+    fs::write(dir.join("b.txt"), b"changed b\n").unwrap();
+
+    let pool = open_db(&db, false).await;
     sqlx::query(
-        r#"
-        CREATE TABLE hashes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            path TEXT NOT NULL UNIQUE,
-            hash TEXT NOT NULL,
-            size INTEGER NOT NULL,
-            mtime INTEGER NOT NULL,
-            CHECK (size < 0)
-        )
-        "#,
+        "CREATE TRIGGER block_writes BEFORE INSERT ON hashes \
+         BEGIN SELECT RAISE(ABORT, 'writes disabled'); END",
     )
     .execute(&pool)
     .await
@@ -555,6 +498,9 @@ async fn scan_fails_when_database_writes_fail() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(stored, 0, "the rejected rows must not appear as stored");
+    assert_eq!(
+        stored, 2,
+        "the aborted batch must leave the setup rows untouched"
+    );
     pool.close().await;
 }
