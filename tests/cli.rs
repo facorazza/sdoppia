@@ -4,6 +4,8 @@ use std::{
     process::{Command, Output},
 };
 
+use sha2::{Digest, Sha256};
+use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
 use tempfile::TempDir;
 
 fn sdoppia_bin() -> &'static str {
@@ -26,6 +28,23 @@ fn stdout(output: &Output) -> String {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+async fn open_db(db: &Path, create: bool) -> SqlitePool {
+    let options = SqliteConnectOptions::new()
+        .filename(db)
+        .create_if_missing(create);
+    SqlitePool::connect_with(options).await.unwrap()
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 #[test]
@@ -217,4 +236,129 @@ fn db_path_is_respected() {
     let scan = run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()]);
     assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
     assert!(Path::new(&db).exists(), "custom db file should exist");
+}
+
+/// A cached hash may only be reused when the size **and** the mtime match the
+/// stored row. The stored mtime only has one-second granularity, so a rewrite
+/// that preserves it (`cp -p`, `rsync --times`, tar extraction, `git checkout`,
+/// or a second edit within the same second) is invisible to an mtime-only check
+/// and would keep a stale hash indefinitely.
+///
+/// The test plants the row such a rewrite leaves behind: b.txt's stored hash and
+/// size are stale, but its stored mtime still matches the untouched file on
+/// disk. A correct rescan must notice the size mismatch, rehash b.txt, and put
+/// it back into the duplicate group.
+#[tokio::test]
+async fn size_change_forces_rehash_even_when_mtime_matches() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"AAAA\n").unwrap();
+    fs::write(dir.join("b.txt"), b"AAAA\n").unwrap();
+
+    let db = tmp.path().join("test.db");
+    let report = tmp.path().join("report.txt");
+
+    let first = run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()]);
+    assert!(
+        first.status.success(),
+        "first scan failed: {}",
+        stderr(&first)
+    );
+
+    let pool = open_db(&db, false).await;
+    sqlx::query("UPDATE hashes SET size = 999, hash = ? WHERE path LIKE '%b.txt'")
+        .bind(sha256_hex(b"ZZZZ\n"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let second = run(&[
+        "scan",
+        dir.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--output",
+        report.to_str().unwrap(),
+    ]);
+    assert!(
+        second.status.success(),
+        "second scan failed: {}",
+        stderr(&second)
+    );
+
+    let report_text = fs::read_to_string(&report).unwrap();
+    assert!(
+        report_text.contains("Duplicate groups: 1"),
+        "b.txt was not rehashed after its size changed, so it was wrongly excluded \
+         from the duplicate group. Report:\n{report_text}"
+    );
+}
+
+/// Hashes that never reach the database must not be reported as a successful
+/// scan. The run has to exit non-zero and must not emit a report derived from a
+/// database that is missing every file it just hashed.
+#[tokio::test]
+async fn scan_fails_when_database_writes_fail() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"AAAA\n").unwrap();
+    fs::write(dir.join("b.txt"), b"AAAA\n").unwrap();
+
+    let db = tmp.path().join("test.db");
+    let report = tmp.path().join("report.txt");
+
+    // Identical to the schema sdoppia creates, plus a constraint that rejects
+    // every row it will try to insert.
+    let pool = open_db(&db, true).await;
+    sqlx::query(
+        r#"
+        CREATE TABLE hashes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL UNIQUE,
+            hash TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime INTEGER NOT NULL,
+            CHECK (size < 0)
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let output = run(&[
+        "scan",
+        dir.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--output",
+        report.to_str().unwrap(),
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "a scan that stored nothing must exit non-zero, got stdout: {}",
+        stdout(&output)
+    );
+    assert!(
+        stderr(&output).contains("Database operation failed"),
+        "stderr should surface the insert failure, got: {}",
+        stderr(&output)
+    );
+    assert!(
+        !report.exists(),
+        "no report may be written when the hashes never reached the database"
+    );
+
+    let pool = open_db(&db, false).await;
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM hashes")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 0, "the rejected rows must not appear as stored");
+    pool.close().await;
 }

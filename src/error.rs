@@ -35,6 +35,9 @@ pub enum DedupError {
     #[error("Database operation failed: {0}")]
     Database(#[from] sqlx::Error),
 
+    #[error("Failed to read cached hash for {0} file(s) from the database")]
+    QueryFailed(usize),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

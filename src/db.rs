@@ -15,7 +15,7 @@ use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions};
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
-    error::Result,
+    error::{DedupError, Result},
     models::{Duplicates, FileMetadata, HashedFile},
 };
 
@@ -93,16 +93,32 @@ pub async fn database_writer(
         }
 
         if !buffer.is_empty() {
-            match save_hashes(&pool, &buffer).await {
+            let batch = std::mem::take(&mut buffer);
+            match save_hashes(&pool, &batch).await {
                 Ok(count) => {
                     total_inserted += count;
                     db_pb.inc(count as u64);
                 }
                 Err(e) => {
-                    warn!("Batch insert failed: {}", e);
+                    // A scan that hashed everything but stored nothing looks
+                    // identical to a clean scan, and the report it goes on to
+                    // print would be wrong. Fail loudly instead. Batches
+                    // committed earlier stay in the database; this one is lost,
+                    // and retrying a rejected batch would only fail again.
+                    warn!(
+                        "Batch insert of {} records failed after {} were saved: {}",
+                        batch.len(),
+                        total_inserted,
+                        e
+                    );
+                    db_pb.finish_with_message(format!(
+                        "Failed after {} saved, {} lost",
+                        total_inserted,
+                        batch.len()
+                    ));
+                    return Err(e);
                 }
             }
-            buffer.clear();
         }
 
         // Check for shutdown signal
@@ -151,6 +167,7 @@ pub async fn filter_files(
 ) -> Result<usize> {
     let mut sent_count = 0;
     let mut cached_count = 0;
+    let mut query_errors = 0;
 
     loop {
         // Check for shutdown signal
@@ -169,24 +186,32 @@ pub async fn filter_files(
         };
 
         if !rehash {
-            match sqlx::query("SELECT mtime FROM hashes WHERE path = ?")
+            match sqlx::query("SELECT size, mtime FROM hashes WHERE path = ?")
                 .bind(file.absolute_path.to_string_lossy())
                 .fetch_one(&pool)
                 .await
             {
                 Ok(row) => {
+                    let stored_size: i64 = row.get("size");
                     let stored_mtime: i64 = row.get("mtime");
-                    if stored_mtime == file.mtime {
-                        // File hasn't been modified, use cached hash
+                    // Both size and mtime must match before the stored hash is
+                    // trusted. Checking mtime alone is not enough: the stored
+                    // timestamp has one-second granularity, so any rewrite that
+                    // preserves the mtime (cp -p, rsync --times, tar extraction,
+                    // git checkout, or a second edit within the same second) is
+                    // invisible to us and would keep a stale hash forever.
+                    if stored_size == file.size && stored_mtime == file.mtime {
                         cached_count += 1;
                         continue;
                     }
-                    // File has been modified, need to rehash
+                    // File has changed, need to rehash
                 }
                 Err(sqlx::Error::RowNotFound) => (),
                 Err(e) => {
-                    warn!("Database query error: {}", e);
-                    continue;
+                    // Dropping the file here would silently shrink the scan,
+                    // so record it and fail the run once draining completes.
+                    query_errors += 1;
+                    warn!("Database query error for {}: {}", file.path.display(), e);
                 }
             }
         }
@@ -196,6 +221,10 @@ pub async fn filter_files(
         let mut file = file;
         loop {
             if shutdown.load(Ordering::Relaxed) {
+                scan_pb.finish_with_message(format!(
+                    "⚠ Interrupted: Cached: {}, Need hashing: {}",
+                    cached_count, sent_count
+                ));
                 return Ok(sent_count);
             }
             match filtered_files_tx.try_send(file) {
@@ -224,6 +253,10 @@ pub async fn filter_files(
         "Cached: {}, Need hashing: {}",
         cached_count, sent_count
     ));
+
+    if query_errors > 0 {
+        return Err(DedupError::QueryFailed(query_errors));
+    }
 
     Ok(sent_count)
 }
