@@ -166,6 +166,7 @@ links may be reported as duplicates there.
 
 - `0` — success
 - `1` — error (e.g. a scan path does not exist, database failure)
+- `130` — interrupted with Ctrl+C
 
 A scan also fails if the hashes could not be written to the database. The report
 is only produced from a database that actually received the results, so a

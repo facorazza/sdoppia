@@ -50,17 +50,33 @@ async fn run() -> Result<()> {
         .with_line_number(true)
         .init();
 
-    // Set up Ctrl+C handler
+    // Set up Ctrl+C handler.
+    //
+    // The handler has to stay armed: tokio installs its SIGINT handler for the
+    // lifetime of the process, so awaiting `ctrl_c()` once and returning leaves
+    // every later Ctrl+C swallowed with nobody listening. Without this loop a
+    // second press does nothing at all, and once the pipeline joins there is no
+    // path out of the process.
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
     tokio::spawn(async move {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => {
-                warn!("Received Ctrl+C, initiating graceful shutdown...");
-                shutdown_clone.store(true, Ordering::SeqCst);
-            }
-            Err(e) => {
-                warn!("Failed to listen for Ctrl+C: {}", e);
+        loop {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => {
+                    // swap reports the previous value, so the first signal asks
+                    // for a graceful stop and any later one is read as the user
+                    // insisting. Shutdown is cooperative, so a stage stuck in a
+                    // long-running query can only be escaped this way.
+                    if shutdown_clone.swap(true, Ordering::SeqCst) {
+                        warn!("Received Ctrl+C again, exiting immediately");
+                        std::process::exit(130);
+                    }
+                    warn!("Received Ctrl+C, stopping after the current stage...");
+                }
+                Err(e) => {
+                    warn!("Failed to listen for Ctrl+C: {}", e);
+                    return;
+                }
             }
         }
     });
@@ -209,8 +225,21 @@ async fn run() -> Result<()> {
                 scanned, filtered, written
             );
 
-            export_duplicates(&pool, output.as_deref(), min_size).await?;
+            export_duplicates(&pool, output.as_deref(), min_size, Arc::clone(&shutdown)).await?;
             pool.close().await;
+
+            // Ctrl+C leaves a partial picture of the tree, so the run must not
+            // look successful even though every stage drained cleanly. This flag
+            // is the single source of truth for that decision: export_duplicates
+            // watches it too, and declines to write a report derived from a
+            // partial scan.
+            if shutdown.load(Ordering::Relaxed) {
+                warn!(
+                    "Scan interrupted: {} scanned, {} hashed, {} written",
+                    scanned, filtered, written
+                );
+                std::process::exit(130);
+            }
         }
         Commands::Clear { db } => {
             let db_path = db.unwrap_or_else(default_db_path);

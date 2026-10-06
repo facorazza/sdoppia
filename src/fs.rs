@@ -49,7 +49,10 @@ pub fn scan(
         }
 
         if path.is_file() {
-            send_file(fs_scanner_tx, path)?;
+            if let Some(count) = send_or_stop(fs_scanner_tx, path, file_count, &shutdown)? {
+                scan_pb.finish_with_message(format!("⚠ Interrupted: Scanned {} files", count));
+                return Ok(count);
+            }
             file_count += 1;
         } else if path.is_dir() {
             for entry in WalkDir::new(path)
@@ -71,7 +74,12 @@ pub fn scan(
                     continue;
                 }
 
-                send_file(fs_scanner_tx, entry.path())?;
+                if let Some(count) =
+                    send_or_stop(fs_scanner_tx, entry.path(), file_count, &shutdown)?
+                {
+                    scan_pb.finish_with_message(format!("⚠ Interrupted: Scanned {} files", count));
+                    return Ok(count);
+                }
                 file_count += 1;
 
                 scan_pb.set_message(format!("{} files", file_count));
@@ -87,6 +95,31 @@ pub fn scan(
 
     scan_pb.finish_with_message(format!("✓ Scanned {} files", file_count));
     Ok(file_count)
+}
+
+/// Queue one file, treating a closed channel as the interrupt it nearly always
+/// is.
+///
+/// Once the filter stops it drops its receiver, so a send can fail simply because
+/// the interrupt reached the downstream stage before the scanner noticed it.
+/// Reporting that as an error would turn every Ctrl+C into a spurious failure,
+/// so it is folded into the ordinary shutdown path instead.
+///
+/// Returns the file count to report when the scan should stop.
+fn send_or_stop(
+    tx: &Sender<FileMetadata>,
+    path: &Path,
+    file_count: usize,
+    shutdown: &AtomicBool,
+) -> Result<Option<usize>> {
+    match send_file(tx, path) {
+        Ok(()) => Ok(None),
+        Err(DedupError::ChannelClosed) if shutdown.load(Ordering::Relaxed) => {
+            warn!("Downstream stopped during scan");
+            Ok(Some(file_count))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn send_file(fs_scanner_tx: &Sender<FileMetadata>, path: &Path) -> Result<()> {

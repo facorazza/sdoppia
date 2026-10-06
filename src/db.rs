@@ -306,6 +306,7 @@ pub async fn export_duplicates(
     pool: &SqlitePool,
     output: Option<&Path>,
     min_size: i64,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     info!("Finding duplicates...");
 
@@ -316,6 +317,14 @@ pub async fn export_duplicates(
             .unwrap(),
     );
     pb.set_message("Querying database for duplicates...");
+
+    // Checked before the group query, not just inside the loop: on a large
+    // database that single query is seconds of uninterruptible work, so waiting
+    // for it to finish before noticing would make Ctrl+C feel ignored.
+    if shutdown.load(Ordering::Relaxed) {
+        pb.finish_with_message("⚠ Interrupted: report not written");
+        return Ok(());
+    }
 
     // Count distinct filesystem objects per hash, not rows: several paths may
     // point at one object through a hard or symbolic link, and those are not
@@ -356,6 +365,15 @@ pub async fn export_duplicates(
     let mut duplicate_groups = Vec::new();
 
     for row in hash_rows {
+        // The report walks one query per duplicate group, which on a large
+        // database is long enough that a user pressing Ctrl+C expects it to
+        // take effect. Without this the signal is ignored until the whole
+        // report is built.
+        if shutdown.load(Ordering::Relaxed) {
+            pb.finish_with_message("⚠ Interrupted: report not written");
+            return Ok(());
+        }
+
         let hash: String = row.get("hash");
         let size: i64 = row.get("size");
 
