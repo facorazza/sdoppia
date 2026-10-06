@@ -2,10 +2,20 @@ use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
 pub struct FileMetadata {
+    /// The path as the user asked for it, used for progress and error messages.
     pub path: PathBuf,
+    /// The same path made absolute but *not* symlink-resolved: this is the
+    /// database key and the path printed in the report, so it must stay
+    /// recognisable to the user instead of collapsing to some canonical target.
     pub absolute_path: PathBuf,
     pub size: i64,
     pub mtime: i64,
+    /// Filesystem object identity, `(device, inode)`. Two paths with the same
+    /// identity are the same bytes on disk reached twice, i.e. a symbolic or
+    /// hard link, not a duplicate worth reclaiming space from. `(0, 0)` means
+    /// unknown, which is what platforms without inode data report.
+    pub dev: i64,
+    pub ino: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -14,16 +24,35 @@ pub struct HashedFile {
     pub size: i64,
     pub mtime: i64,
     pub hash: String,
+    pub dev: i64,
+    pub ino: i64,
 }
 
 #[derive(Debug)]
 pub struct Duplicates {
     pub hash: String,
     pub size: i64,
+    /// One path per distinct filesystem object in the group.
     pub files: Vec<String>,
+    /// Extra paths that are links to one of `files`, so deleting them reclaims
+    /// nothing. Kept separate so the report never presents them as waste.
+    pub aliases: Vec<String>,
 }
 
 impl Duplicates {
+    /// Distinct filesystem objects in the group. Hard and symbolic links share
+    /// an inode and therefore count once.
+    pub fn copies(&self) -> usize {
+        self.files.len()
+    }
+
+    pub fn is_duplicate(&self) -> bool {
+        self.files.len() > 1
+    }
+
+    /// Bytes genuinely reclaimable: every object past the first. Links to an
+    /// object already counted contribute nothing, because removing a link does
+    /// not free the data it points at.
     pub fn wasted_space(&self) -> i64 {
         self.size * (self.files.len() as i64 - 1)
     }
@@ -71,23 +100,45 @@ mod tests {
         assert_eq!(Duplicates::format_size(3 * 1024 * 1024 * 1024), "3.00 GB");
     }
 
-    #[test]
-    fn wasted_space_counts_all_but_one_copy() {
-        let group = Duplicates {
+    fn group(files: &[&str], aliases: &[&str]) -> Duplicates {
+        Duplicates {
             hash: "abc".to_string(),
             size: 100,
-            files: vec!["a".to_string(), "b".to_string(), "c".to_string()],
-        };
-        assert_eq!(group.wasted_space(), 200);
+            files: files.iter().map(|s| s.to_string()).collect(),
+            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn wasted_space_counts_all_but_one_copy() {
+        let g = group(&["a", "b", "c"], &[]);
+        assert_eq!(g.copies(), 3);
+        assert_eq!(g.wasted_space(), 200);
+        assert!(g.is_duplicate());
     }
 
     #[test]
     fn wasted_space_single_file_is_zero() {
-        let group = Duplicates {
-            hash: "abc".to_string(),
-            size: 100,
-            files: vec!["a".to_string()],
-        };
-        assert_eq!(group.wasted_space(), 0);
+        let g = group(&["a"], &[]);
+        assert_eq!(g.wasted_space(), 0);
+        assert!(!g.is_duplicate());
+    }
+
+    #[test]
+    fn links_to_one_object_are_not_duplicates() {
+        // Two paths, one inode: reporting this as a duplicate would claim
+        // reclaimable bytes that cannot be reclaimed.
+        let g = group(&["a"], &["a_link", "a_hardlink"]);
+        assert_eq!(g.copies(), 1);
+        assert_eq!(g.wasted_space(), 0);
+        assert!(!g.is_duplicate());
+    }
+
+    #[test]
+    fn links_do_not_inflate_wasted_space_of_a_real_duplicate() {
+        let g = group(&["a", "b"], &["a_link"]);
+        assert_eq!(g.copies(), 2);
+        assert_eq!(g.wasted_space(), 100);
+        assert!(g.is_duplicate());
     }
 }

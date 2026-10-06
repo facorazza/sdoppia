@@ -127,21 +127,49 @@ Files:
   - /home/user/docs/b.txt
 ```
 
+## Links, copies and wasted space
+
+A path on disk and the bytes it points at are not the same thing, so `sdoppia`
+keeps them apart: paths are stored exactly as you asked for them, and each file
+is also identified by its `(device, inode)` pair.
+
+- **Copies** are distinct filesystem objects. Removing every copy but one is
+  what "wasted space" measures.
+- **Links** — symbolic links and hard links alike — point at an object that is
+  already counted. Removing a link frees nothing, so it is listed separately and
+  never contributes to the wasted-space total.
+- A file and its own links are therefore **not** a duplicate group. You need two
+  separate objects with the same content before anything is reported.
+
+Paths are stored as scanned, without resolving symbolic links, so scanning
+through a symlinked directory reports paths under the name you typed. That also
+means the same object reached by two different routes is stored twice and
+recognised as one object rather than one of the rows being dropped.
+
+Hard-link detection relies on inode data, which is available on Unix. Elsewhere
+(Windows) identity is unknown and every path counts as its own copy, so hard
+links may be reported as duplicates there.
+
 ## How it works
 
 1. **Scan** — walk the given paths and collect file metadata (path, size,
-   modification time).
+   modification time, device and inode).
 2. **Filter** — for each file, check the database: if the size and
    modification time match a cached entry, reuse the stored hash; otherwise
    queue the file for hashing.
 3. **Hash** — SHA-256 hash queued files in parallel.
 4. **Store** — batch-insert hashes into the SQLite database.
-5. **Report** — group files by hash and list groups with more than one copy.
+5. **Report** — group files by hash, split each group into distinct objects and
+   links to them, and list groups holding more than one object.
 
 ## Exit codes
 
 - `0` — success
 - `1` — error (e.g. a scan path does not exist, database failure)
+
+A scan also fails if the hashes could not be written to the database. The report
+is only produced from a database that actually received the results, so a
+partially saved scan never looks like a clean one.
 
 ## Development
 

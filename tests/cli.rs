@@ -238,6 +238,202 @@ fn db_path_is_respected() {
     assert!(Path::new(&db).exists(), "custom db file should exist");
 }
 
+/// Two paths with identical content are only reclaimable waste when they are
+/// distinct objects. A hard link shares the original's inode, so removing one
+/// frees nothing and must not be counted as a copy.
+#[test]
+fn hard_link_is_not_counted_as_a_reclaimable_copy() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"AAAA\n").unwrap();
+    fs::write(dir.join("b.txt"), b"AAAA\n").unwrap();
+    fs::hard_link(dir.join("a.txt"), dir.join("a_hardlink")).unwrap();
+
+    let db = tmp.path().join("test.db");
+    let report = tmp.path().join("report.txt");
+
+    let scan = run(&[
+        "scan",
+        dir.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--output",
+        report.to_str().unwrap(),
+    ]);
+    assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
+
+    let text = fs::read_to_string(&report).unwrap();
+    assert!(
+        text.contains("Copies: 2"),
+        "a hard link must not inflate the copy count:\n{text}"
+    );
+    assert!(
+        text.contains("Wasted: 5 bytes"),
+        "only the genuinely separate copy is waste:\n{text}"
+    );
+    assert!(
+        text.contains("a_hardlink"),
+        "the link should still be listed, just not as a copy:\n{text}"
+    );
+
+    let stats = run(&["stats", "--db", db.to_str().unwrap()]);
+    assert!(
+        stdout(&stats).contains("Duplicate files: 1"),
+        "stats must agree with the report, got: {}",
+        stdout(&stats)
+    );
+}
+
+/// One file plus links to it is one object, so there is nothing to reclaim and
+/// no duplicate group at all.
+#[test]
+fn links_without_a_second_object_form_no_duplicate_group() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"AAAA\n").unwrap();
+    fs::hard_link(dir.join("a.txt"), dir.join("a_hardlink")).unwrap();
+
+    let db = tmp.path().join("test.db");
+    let report = tmp.path().join("report.txt");
+
+    let scan = run(&[
+        "scan",
+        dir.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--output",
+        report.to_str().unwrap(),
+    ]);
+    assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
+
+    let text = fs::read_to_string(&report).unwrap();
+    assert!(
+        text.contains("Duplicate groups: 0"),
+        "a file and its own link are not a duplicate pair:\n{text}"
+    );
+    assert!(text.contains("Total duplicate files: 0"), "{text}");
+
+    let stats = run(&["stats", "--db", db.to_str().unwrap()]);
+    assert!(
+        stdout(&stats).contains("Duplicate files: 0"),
+        "stats must agree with the report, got: {}",
+        stdout(&stats)
+    );
+    assert!(
+        stdout(&stats).contains("Wasted space: 0 bytes"),
+        "stats must agree with the report, got: {}",
+        stdout(&stats)
+    );
+}
+
+/// The stored path must be the one the user asked for, not a symlink-resolved
+/// target. Resolving links used to make a symlink and its target collide on the
+/// unique path key, so one of the two rows was silently dropped.
+#[cfg(unix)]
+#[test]
+fn follow_links_keeps_a_symlink_and_its_target_as_separate_paths() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"AAAA\n").unwrap();
+    fs::write(dir.join("b.txt"), b"AAAA\n").unwrap();
+    std::os::unix::fs::symlink(dir.join("a.txt"), dir.join("a_symlink")).unwrap();
+
+    let db = tmp.path().join("test.db");
+    let report = tmp.path().join("report.txt");
+
+    let scan = run(&[
+        "scan",
+        dir.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--output",
+        report.to_str().unwrap(),
+        "--follow-links",
+    ]);
+    assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
+
+    let text = fs::read_to_string(&report).unwrap();
+    assert!(
+        text.contains("Copies: 2"),
+        "a.txt and b.txt are the only distinct objects:\n{text}"
+    );
+    assert!(
+        text.contains("a_symlink"),
+        "the symlink must be listed rather than collapsed into its target:\n{text}"
+    );
+
+    let stats = run(&["stats", "--db", db.to_str().unwrap()]);
+    assert!(
+        stdout(&stats).contains("Total files: 3"),
+        "all three paths should be stored, got: {}",
+        stdout(&stats)
+    );
+}
+
+/// Databases created before hard-link detection have no dev/ino columns. The
+/// migration must add them without disturbing existing rows, which keep the
+/// "unknown identity" default and count individually as they always have.
+#[tokio::test]
+async fn existing_database_gains_identity_columns_without_data_loss() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"AAAA\n").unwrap();
+
+    let db = tmp.path().join("legacy.db");
+
+    let pool = open_db(&db, true).await;
+    sqlx::query(
+        "CREATE TABLE hashes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL UNIQUE,
+            hash TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime INTEGER NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO hashes (path, hash, size, mtime) VALUES (?, ?, ?, ?)")
+        .bind("/legacy/a.txt")
+        .bind("deadbeef")
+        .bind(5i64)
+        .bind(1i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let scan = run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()]);
+    assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
+
+    let pool = open_db(&db, false).await;
+    let legacy: (String, i64, i64) =
+        sqlx::query_as("SELECT hash, dev, ino FROM hashes WHERE path = '/legacy/a.txt'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(legacy.0, "deadbeef", "the pre-existing row must survive");
+    assert_eq!(
+        (legacy.1, legacy.2),
+        (0, 0),
+        "rows predating the migration get the unknown-identity default"
+    );
+    pool.close().await;
+
+    // Running again must be idempotent: the columns already exist.
+    let second = run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()]);
+    assert!(
+        second.status.success(),
+        "rescan failed: {}",
+        stderr(&second)
+    );
+}
+
 /// A cached hash may only be reused when the size **and** the mtime match the
 /// stored row. The stored mtime only has one-second granularity, so a rewrite
 /// that preserves it (`cp -p`, `rsync --times`, tar extraction, `git checkout`,

@@ -11,7 +11,7 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender};
 use indicatif::{ProgressBar, ProgressStyle};
-use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions};
+use sqlx::{AssertSqlSafe, Row, SqlitePool, sqlite::SqliteConnectOptions};
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
@@ -51,11 +51,31 @@ pub async fn init_database(db_path: &Path) -> Result<SqlitePool> {
             path TEXT NOT NULL UNIQUE,
             hash TEXT NOT NULL,
             size INTEGER NOT NULL,
-            mtime INTEGER NOT NULL
+            mtime INTEGER NOT NULL,
+            dev INTEGER NOT NULL DEFAULT 0,
+            ino INTEGER NOT NULL DEFAULT 0
         )
         "#,
     )
     .execute(&pool)
+    .await?;
+
+    // Databases created before hard-link detection have no dev/ino columns.
+    // Existing rows keep the default of 0, which reads as "unknown identity"
+    // and makes them count as individual copies, exactly as they did before.
+    add_missing_columns(
+        &pool,
+        &[
+            (
+                "dev",
+                "ALTER TABLE hashes ADD COLUMN dev INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "ino",
+                "ALTER TABLE hashes ADD COLUMN ino INTEGER NOT NULL DEFAULT 0",
+            ),
+        ],
+    )
     .await?;
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_hash ON hashes(hash)")
@@ -68,6 +88,86 @@ pub async fn init_database(db_path: &Path) -> Result<SqlitePool> {
 
     debug!("Database initialized successfully");
     Ok(pool)
+}
+
+/// Idempotently add columns that older databases predate.
+///
+/// `table` is intentionally not a parameter: it is interpolated into the
+/// `PRAGMA` below, and hardcoding it keeps that statement a literal.
+async fn add_missing_columns(pool: &SqlitePool, columns: &[(&str, &'static str)]) -> Result<()> {
+    let existing: Vec<String> = sqlx::query("PRAGMA table_info(hashes)")
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect();
+
+    for (name, ddl) in columns {
+        if !existing.iter().any(|c| c == name) {
+            debug!("Adding column {name} to hashes");
+            sqlx::query(*ddl).execute(pool).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// SQL expression identifying the filesystem object a row refers to.
+///
+/// Hard links and symbolic links share an inode, so rows with the same
+/// expression are one object reached by several paths. When the identity is
+/// unknown (`ino = 0`, covering pre-migration rows and platforms without inode
+/// data) the path stands in, so those rows keep counting individually instead
+/// of collapsing into one.
+const IDENTITY_EXPR: &str =
+    "CASE WHEN ino = 0 THEN 'p:' || path ELSE 'i:' || dev || ':' || ino END";
+
+// The queries below are assembled with `format!` purely to inject
+// `IDENTITY_EXPR` and a size filter chosen from a literal. Keeping that
+// expression in one place matters more than avoiding `format!`, because every
+// duplicate and wasted-space metric has to agree on what counts as a copy, and
+// a missed edit here would silently skew the report. No user input reaches any
+// of these strings; scanned paths and sizes travel as bind parameters.
+//
+// `sqlx::AssertSqlSafe` is the documented way to pass a SQL string that is not
+// a compile-time literal. It is sound here for the reason above.
+
+/// Hashes with more than one distinct filesystem object behind them.
+fn duplicate_groups_query(min_size: i64) -> AssertSqlSafe<String> {
+    let filter = if min_size > 0 { "WHERE size >= ?" } else { "" };
+    AssertSqlSafe(format!(
+        "SELECT hash, size FROM hashes {filter} \
+         GROUP BY hash \
+         HAVING COUNT(DISTINCT {IDENTITY_EXPR}) > 1 \
+         ORDER BY size DESC"
+    ))
+}
+
+/// Every path in a duplicate group, paired with the object it refers to and
+/// ordered so each object's paths are adjacent and deterministic.
+fn group_paths_query() -> AssertSqlSafe<String> {
+    AssertSqlSafe(format!(
+        "SELECT path, {IDENTITY_EXPR} AS identity FROM hashes WHERE hash = ? \
+         ORDER BY identity, path"
+    ))
+}
+
+/// Copies beyond the first per hash, summed over all duplicate groups.
+fn redundant_copies_query() -> AssertSqlSafe<String> {
+    AssertSqlSafe(format!(
+        "SELECT COALESCE(SUM(copies - 1), 0) FROM (\
+            SELECT COUNT(DISTINCT {IDENTITY_EXPR}) AS copies \
+            FROM hashes GROUP BY hash HAVING copies > 1)"
+    ))
+}
+
+/// Reclaimable bytes: every distinct object past the first, links excluded.
+fn wasted_space_query() -> AssertSqlSafe<String> {
+    AssertSqlSafe(format!(
+        "SELECT COALESCE(SUM(size * (copies - 1)), 0) FROM (\
+            SELECT size, COUNT(DISTINCT {IDENTITY_EXPR}) AS copies \
+            FROM hashes GROUP BY hash HAVING copies > 1)"
+    ))
 }
 
 pub async fn database_writer(
@@ -143,13 +243,17 @@ async fn save_hashes(pool: &SqlitePool, files: &[HashedFile]) -> Result<usize> {
     let mut tx = pool.begin().await?;
 
     for file in files {
-        sqlx::query("INSERT OR REPLACE INTO hashes (path, hash, size, mtime) VALUES (?, ?, ?, ?)")
-            .bind(file.absolute_path.to_string_lossy())
-            .bind(&file.hash)
-            .bind(file.size)
-            .bind(file.mtime)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO hashes (path, hash, size, mtime, dev, ino) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(file.absolute_path.to_string_lossy())
+        .bind(&file.hash)
+        .bind(file.size)
+        .bind(file.mtime)
+        .bind(file.dev)
+        .bind(file.ino)
+        .execute(&mut *tx)
+        .await?;
     }
 
     tx.commit().await?;
@@ -277,29 +381,13 @@ pub async fn export_duplicates(
     );
     pb.set_message("Querying database for duplicates...");
 
-    let hash_query = if min_size > 0 {
-        sqlx::query(
-            r#"
-            SELECT hash, COUNT(*) as count, size
-            FROM hashes
-            WHERE size >= ?
-            GROUP BY hash
-            HAVING count > 1
-            ORDER BY size DESC
-            "#,
-        )
-        .bind(min_size)
-    } else {
-        sqlx::query(
-            r#"
-            SELECT hash, COUNT(*) as count, size
-            FROM hashes
-            GROUP BY hash
-            HAVING count > 1
-            ORDER BY size DESC
-            "#,
-        )
-    };
+    // Count distinct filesystem objects per hash, not rows: several paths may
+    // point at one object through a hard or symbolic link, and those are not
+    // reclaimable copies.
+    let mut hash_query = sqlx::query(duplicate_groups_query(min_size));
+    if min_size > 0 {
+        hash_query = hash_query.bind(min_size);
+    }
 
     let hash_rows = hash_query.fetch_all(pool).await?;
 
@@ -335,27 +423,49 @@ pub async fn export_duplicates(
         let hash: String = row.get("hash");
         let size: i64 = row.get("size");
 
-        let file_rows = sqlx::query("SELECT path FROM hashes WHERE hash = ?")
+        let file_rows = sqlx::query(group_paths_query())
             .bind(&hash)
             .fetch_all(pool)
             .await?;
 
-        let files: Vec<String> = file_rows
-            .into_iter()
-            .map(|r| r.get::<String, _>("path"))
-            .collect();
+        // Partition the group by filesystem object: the first path seen for an
+        // object is a real copy, and every later path for that same object is
+        // just a link to it, so it is listed separately instead of being
+        // counted as reclaimable space.
+        let mut copies: Vec<String> = Vec::new();
+        let mut aliases: Vec<String> = Vec::new();
+        let mut seen_identities: Vec<String> = Vec::new();
 
-        if files.len() < 2 {
-            continue;
+        for row in file_rows {
+            let path: String = row.get("path");
+            let identity: String = row.get("identity");
+            if seen_identities.contains(&identity) {
+                aliases.push(path);
+            } else {
+                seen_identities.push(identity);
+                copies.push(path);
+            }
         }
 
-        duplicate_groups.push(Duplicates { hash, size, files });
+        if !copies.is_empty() {
+            duplicate_groups.push(Duplicates {
+                hash,
+                size,
+                files: copies,
+                aliases,
+            });
+        }
         pb.inc(1);
     }
 
     pb.finish_with_message(format!("Found {} duplicate groups", duplicate_groups.len()));
 
-    let total_duplicate_count: usize = duplicate_groups.iter().map(|g| g.files.len() - 1).sum();
+    let total_duplicate_count: usize = duplicate_groups
+        .iter()
+        .filter(|g| g.is_duplicate())
+        .map(|g| g.copies() - 1)
+        .sum();
+    let total_links: usize = duplicate_groups.iter().map(|g| g.aliases.len()).sum();
     let wasted_space: i64 = duplicate_groups.iter().map(|g| g.wasted_space()).sum();
 
     let mut output_lines = Vec::new();
@@ -371,13 +481,19 @@ pub async fn export_duplicates(
         Duplicates::format_size(wasted_space)
     ));
     output_lines.push(format!("Duplicate groups: {}", duplicate_groups.len()));
+    if total_links > 0 {
+        output_lines.push(format!(
+            "Linked paths (share storage, reclaiming none): {}",
+            total_links
+        ));
+    }
     output_lines.push(String::new());
 
     for (idx, group) in duplicate_groups.iter().enumerate() {
         output_lines.push(format!("--- Group {} ---", idx + 1));
         output_lines.push(format!("Hash: {}", group.hash));
         output_lines.push(format!("Size: {}", Duplicates::format_size(group.size)));
-        output_lines.push(format!("Copies: {}", group.files.len()));
+        output_lines.push(format!("Copies: {}", group.copies()));
         output_lines.push(format!(
             "Wasted: {}",
             Duplicates::format_size(group.wasted_space())
@@ -387,6 +503,14 @@ pub async fn export_duplicates(
         for path in &group.files {
             output_lines.push(format!("  - {}", path));
         }
+
+        if !group.aliases.is_empty() {
+            output_lines.push("Links to the above (not extra copies):".to_string());
+            for path in &group.aliases {
+                output_lines.push(format!("  - {}", path));
+            }
+        }
+
         output_lines.push(String::new());
     }
 
@@ -414,31 +538,15 @@ pub async fn show_stats(pool: &SqlitePool) -> Result<()> {
         .fetch_one(pool)
         .await?;
 
-    let duplicate_files: i64 = sqlx::query_scalar(
-        r#"
-        SELECT COALESCE(SUM(count - 1), 0) FROM (
-            SELECT COUNT(*) as count
-            FROM hashes
-            GROUP BY hash
-            HAVING count > 1
-        )
-        "#,
-    )
-    .fetch_one(pool)
-    .await?;
+    // Both duplicate metrics count distinct filesystem objects, so that links
+    // to a file already counted never inflate the numbers reported here.
+    let duplicate_files: i64 = sqlx::query_scalar(redundant_copies_query())
+        .fetch_one(pool)
+        .await?;
 
-    let wasted_space: i64 = sqlx::query_scalar(
-        r#"
-        SELECT COALESCE(SUM(size * (count - 1)), 0) FROM (
-            SELECT size, COUNT(*) as count
-            FROM hashes
-            GROUP BY hash
-            HAVING count > 1
-        )
-        "#,
-    )
-    .fetch_one(pool)
-    .await?;
+    let wasted_space: i64 = sqlx::query_scalar(wasted_space_query())
+        .fetch_one(pool)
+        .await?;
 
     println!("=== DATABASE STATISTICS ===");
     println!("Total files: {}", total_files);

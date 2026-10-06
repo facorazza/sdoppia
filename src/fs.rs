@@ -92,22 +92,8 @@ pub fn scan(
 fn send_file(fs_scanner_tx: &Sender<FileMetadata>, path: &Path) -> Result<()> {
     debug!("Processing file: {}", path.display());
 
-    let metadata = std::fs::metadata(path).map_err(|e| DedupError::Metadata {
-        path: path.display().to_string(),
-        source: e,
-    })?;
-    let absolute_path = path.canonicalize()?;
-    let size = metadata.len() as i64;
-    if size == 0 {
+    let Some(file_meta) = file_metadata(path)? else {
         return Ok(());
-    }
-    let mtime = get_modified_time(&absolute_path)?;
-
-    let file_meta = FileMetadata {
-        path: path.to_path_buf(),
-        absolute_path,
-        size,
-        mtime,
     };
 
     if fs_scanner_tx.send(file_meta).is_err() {
@@ -120,19 +106,63 @@ fn send_file(fs_scanner_tx: &Sender<FileMetadata>, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn get_modified_time(path: &Path) -> Result<i64> {
+/// Collect everything we need about a file from a single stat call.
+///
+/// Size, mtime and identity must come from one snapshot: reading them from
+/// separate calls can pair a new size with an old mtime, producing a hash that
+/// never matches the `(size, mtime)` pair stored alongside it and is therefore
+/// never reused on the next scan.
+///
+/// Returns `Ok(None)` for empty files, which are not scanned.
+fn file_metadata(path: &Path) -> Result<Option<FileMetadata>> {
     let metadata = std::fs::metadata(path).map_err(|e| DedupError::Metadata {
         path: path.display().to_string(),
         source: e,
     })?;
+
+    if metadata.len() == 0 {
+        return Ok(None);
+    }
+
     let modified = metadata
         .modified()
         .map_err(|e| DedupError::ModificationTime {
             path: path.display().to_string(),
             source: e,
         })?;
-    let duration = modified.duration_since(SystemTime::UNIX_EPOCH)?;
-    Ok(duration.as_secs() as i64)
+    let mtime = modified.duration_since(SystemTime::UNIX_EPOCH)?.as_secs() as i64;
+    let (dev, ino) = file_identity(&metadata);
+
+    Ok(Some(FileMetadata {
+        path: path.to_path_buf(),
+        // Absolute but deliberately not symlink-resolved. `canonicalize` would
+        // map every link to its target, so a symlink and its target would
+        // collide on the `path` unique key and the `UNIQUE` constraint would
+        // silently drop one of them, hiding real duplicates. Keeping the path
+        // the user scanned also keeps the report readable.
+        absolute_path: std::path::absolute(path)?,
+        size: metadata.len() as i64,
+        mtime,
+        dev,
+        ino,
+    }))
+}
+
+/// Filesystem object identity: `(device, inode)`.
+///
+/// Two paths sharing an identity are the same bytes on disk, reachable twice
+/// through a symbolic or hard link. Only Unix exposes this through `std` in a
+/// stable form, so other platforms report `(0, 0)` and fall back to counting
+/// every row as its own copy.
+#[cfg(unix)]
+fn file_identity(metadata: &std::fs::Metadata) -> (i64, i64) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev() as i64, metadata.ino() as i64)
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &std::fs::Metadata) -> (i64, i64) {
+    (0, 0)
 }
 
 pub fn get_num_hashers() -> usize {
@@ -169,6 +199,8 @@ pub fn spawn_hash_workers(
                         size: file.size,
                         mtime: file.mtime,
                         hash,
+                        dev: file.dev,
+                        ino: file.ino,
                     };
 
                     if hashed_files_tx.send(hashed).is_ok() {
@@ -213,7 +245,7 @@ fn hash_file(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::{fs, io::Write};
 
     #[test]
     fn hash_file_matches_known_sha256() {
@@ -250,9 +282,64 @@ mod tests {
     }
 
     #[test]
-    fn get_modified_time_returns_positive_epoch() {
+    fn file_metadata_reports_positive_epoch_and_real_identity() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"hello world\n").unwrap();
+        file.flush().unwrap();
+
+        let meta = file_metadata(file.path()).unwrap().unwrap();
+        assert_eq!(meta.size, 12);
+        assert!(meta.mtime > 0);
+        assert_eq!(
+            meta.absolute_path,
+            std::path::absolute(file.path()).unwrap()
+        );
+
+        // The identity must be stable across calls for the same file, and must
+        // not be the "unknown" sentinel, otherwise hard-link detection silently
+        // degrades to counting rows.
+        let again = file_metadata(file.path()).unwrap().unwrap();
+        assert_eq!((meta.dev, meta.ino), (again.dev, again.ino));
+        #[cfg(unix)]
+        assert_ne!(meta.ino, 0, "unix must report a real inode");
+    }
+
+    #[test]
+    fn file_metadata_skips_empty_files() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let mtime = get_modified_time(file.path()).unwrap();
-        assert!(mtime > 0);
+        assert!(
+            file_metadata(file.path()).unwrap().is_none(),
+            "empty files are not scanned"
+        );
+    }
+
+    #[test]
+    fn file_metadata_missing_path_errors() {
+        let err = file_metadata(Path::new("/definitely/not/a/real/file")).unwrap_err();
+        assert!(matches!(err, DedupError::Metadata { .. }));
+    }
+
+    #[test]
+    fn distinct_paths_to_one_inode_share_identity() {
+        // This is what makes a hard link stop looking like reclaimable waste.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), b"linked").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("hardlink");
+        fs::hard_link(file.path(), &link).unwrap();
+
+        let original = file_metadata(file.path()).unwrap().unwrap();
+        let via_link = file_metadata(&link).unwrap().unwrap();
+
+        assert_eq!(
+            (original.dev, original.ino),
+            (via_link.dev, via_link.ino),
+            "a hard link must share the original's identity"
+        );
+        assert_ne!(
+            original.absolute_path, via_link.absolute_path,
+            "the stored paths must stay distinct so neither row is lost"
+        );
     }
 }
