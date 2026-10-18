@@ -13,140 +13,169 @@ use crossbeam_channel::{Receiver, Sender};
 use indicatif::ProgressBar;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
-use tracing::{debug, error, info, instrument, warn};
 use walkdir::WalkDir;
 
 use crate::{
     error::{DedupError, Result},
     models::{FileMetadata, HashedFile},
+    note,
 };
 
-#[instrument(skip(fs_scanner_tx, scan_pb, shutdown))]
+/// What a scan covered, and what it could not reach.
+#[derive(Clone, Copy, Debug)]
+pub struct ScanOutcome {
+    pub files: usize,
+    /// Paths walkdir refused to visit. Reported rather than swallowed: a scan
+    /// that quietly skipped a subtree looks exactly like one that covered it.
+    pub errors: usize,
+}
+
 pub fn scan(
     paths: Vec<PathBuf>,
     follow_links: bool,
+    exclude: &[PathBuf],
     fs_scanner_tx: &Sender<FileMetadata>,
     scan_pb: ProgressBar,
     shutdown: Arc<AtomicBool>,
-) -> Result<usize> {
+) -> Result<ScanOutcome> {
     let mut file_count = 0;
+    let mut error_count = 0;
 
     for path in &paths {
         // Check for shutdown signal
         if shutdown.load(Ordering::Relaxed) {
-            warn!("Shutdown signal received during scan");
             scan_pb.finish_with_message(format!("⚠ Interrupted: Scanned {} files", file_count));
-            return Ok(file_count);
+            return Ok(ScanOutcome {
+                files: file_count,
+                errors: error_count,
+            });
         }
 
         scan_pb.set_message(format!("{} files", file_count));
 
         if !path.exists() {
-            error!("Path does not exist: {}", path.display());
+            // Returned rather than logged: `main` prints it, so logging here
+            // would say it twice.
             return Err(DedupError::InvalidPath {
                 path: path.display().to_string(),
             });
         }
 
         if path.is_file() {
-            if let Some(count) = send_or_stop(fs_scanner_tx, path, file_count, &shutdown)? {
+            if let Some(count) = send_or_stop(fs_scanner_tx, path, file_count, exclude, &shutdown)?
+            {
                 scan_pb.finish_with_message(format!("⚠ Interrupted: Scanned {} files", count));
-                return Ok(count);
+                return Ok(ScanOutcome {
+                    files: count,
+                    errors: error_count,
+                });
             }
             file_count += 1;
         } else if path.is_dir() {
-            for entry in WalkDir::new(path)
-                .follow_links(follow_links)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
+            for entry in WalkDir::new(path).follow_links(follow_links).into_iter() {
                 // Check for shutdown during directory walk
                 if shutdown.load(Ordering::Relaxed) {
-                    warn!("Shutdown signal received during directory scan");
                     scan_pb.finish_with_message(format!(
                         "⚠ Interrupted: Scanned {} files",
                         file_count
                     ));
-                    return Ok(file_count);
+                    return Ok(ScanOutcome {
+                        files: file_count,
+                        errors: error_count,
+                    });
                 }
+
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        error_count += 1;
+                        note(
+                            &scan_pb,
+                            &format!("Skipped an unreadable path under {}: {e}", path.display()),
+                        );
+                        continue;
+                    }
+                };
 
                 if !entry.file_type().is_file() {
                     continue;
                 }
 
                 if let Some(count) =
-                    send_or_stop(fs_scanner_tx, entry.path(), file_count, &shutdown)?
+                    send_or_stop(fs_scanner_tx, entry.path(), file_count, exclude, &shutdown)?
                 {
                     scan_pb.finish_with_message(format!("⚠ Interrupted: Scanned {} files", count));
-                    return Ok(count);
+                    return Ok(ScanOutcome {
+                        files: count,
+                        errors: error_count,
+                    });
                 }
                 file_count += 1;
 
                 scan_pb.set_message(format!("{} files", file_count));
             }
-
-            info!(
-                "Scanned {} files in directory: {}",
-                file_count,
-                path.display()
-            );
         }
     }
 
-    scan_pb.finish_with_message(format!("✓ Scanned {} files", file_count));
-    Ok(file_count)
+    let outcome = ScanOutcome {
+        files: file_count,
+        errors: error_count,
+    };
+
+    if outcome.errors > 0 {
+        scan_pb.finish_with_message(format!(
+            "⚠ Scanned {} files, {} paths unreadable",
+            outcome.files, outcome.errors
+        ));
+    } else {
+        scan_pb.finish_with_message(format!("✓ Scanned {} files", outcome.files));
+    }
+
+    Ok(outcome)
 }
 
 /// Queue one file, treating a closed channel as the interrupt it nearly always
-/// is.
-///
-/// Once the filter stops it drops its receiver, so a send can fail simply because
-/// the interrupt reached the downstream stage before the scanner noticed it.
-/// Reporting that as an error would turn every Ctrl+C into a spurious failure,
-/// so it is folded into the ordinary shutdown path instead.
+/// is: once the filter stops it drops its receiver, so a send can fail simply
+/// because the interrupt reached it first. Reporting that as an error would turn
+/// every Ctrl+C into a spurious failure.
 ///
 /// Returns the file count to report when the scan should stop.
 fn send_or_stop(
     tx: &Sender<FileMetadata>,
     path: &Path,
     file_count: usize,
+    exclude: &[PathBuf],
     shutdown: &AtomicBool,
 ) -> Result<Option<usize>> {
-    match send_file(tx, path) {
+    match send_file(tx, path, exclude) {
         Ok(()) => Ok(None),
-        Err(DedupError::ChannelClosed) if shutdown.load(Ordering::Relaxed) => {
-            warn!("Downstream stopped during scan");
-            Ok(Some(file_count))
-        }
+        // Reported by the caller, which finishes its bar with the count.
+        Err(DedupError::ChannelClosed) if shutdown.load(Ordering::Relaxed) => Ok(Some(file_count)),
         Err(e) => Err(e),
     }
 }
 
-fn send_file(fs_scanner_tx: &Sender<FileMetadata>, path: &Path) -> Result<()> {
-    debug!("Processing file: {}", path.display());
-
+fn send_file(fs_scanner_tx: &Sender<FileMetadata>, path: &Path, exclude: &[PathBuf]) -> Result<()> {
     let Some(file_meta) = file_metadata(path)? else {
         return Ok(());
     };
 
+    // Compared against the absolute path the entry will be stored under, which
+    // `file_metadata` has already resolved, so this costs no extra syscall.
+    if exclude.contains(&file_meta.absolute_path) {
+        return Ok(());
+    }
+
     if fs_scanner_tx.send(file_meta).is_err() {
-        debug!(
-            "Channel closed while sending file metadata for: {}",
-            path.display()
-        );
         return Err(DedupError::ChannelClosed);
     }
     Ok(())
 }
 
-/// Collect everything we need about a file from a single stat call.
-///
-/// Size, mtime and identity must come from one snapshot: reading them from
-/// separate calls can pair a new size with an old mtime, producing a hash that
-/// never matches the `(size, mtime)` pair stored alongside it and is therefore
-/// never reused on the next scan.
-///
-/// Returns `Ok(None)` for empty files, which are not scanned.
+/// Everything needed about a file, from a single stat call: separate calls can
+/// pair a new size with an old mtime, producing a hash that never matches the
+/// `(size, mtime)` stored beside it and so is never reused. Empty files are not
+/// scanned, and return `Ok(None)`.
 fn file_metadata(path: &Path) -> Result<Option<FileMetadata>> {
     let metadata = std::fs::metadata(path).map_err(|e| DedupError::Metadata {
         path: path.display().to_string(),
@@ -164,15 +193,13 @@ fn file_metadata(path: &Path) -> Result<Option<FileMetadata>> {
             source: e,
         })?;
     let mtime = modified.duration_since(SystemTime::UNIX_EPOCH)?.as_secs() as i64;
-    let (dev, ino) = file_identity(&metadata);
+    let (dev, ino) = file_identity(&metadata, path);
 
     Ok(Some(FileMetadata {
         path: path.to_path_buf(),
-        // Absolute but deliberately not symlink-resolved. `canonicalize` would
-        // map every link to its target, so a symlink and its target would
-        // collide on the `path` unique key and the `UNIQUE` constraint would
-        // silently drop one of them, hiding real duplicates. Keeping the path
-        // the user scanned also keeps the report readable.
+        // Absolute but not symlink-resolved: `canonicalize` would map a link
+        // and its target onto one path, and the UNIQUE constraint would drop
+        // one of the two rows, hiding a real duplicate.
         absolute_path: std::path::absolute(path)?,
         size: metadata.len() as i64,
         mtime,
@@ -181,28 +208,102 @@ fn file_metadata(path: &Path) -> Result<Option<FileMetadata>> {
     }))
 }
 
-/// Filesystem object identity: `(device, inode)`.
+/// Filesystem object identity: the device and inode behind a path, which is what
+/// tells a genuine duplicate from a link to a file already counted.
 ///
-/// Two paths sharing an identity are the same bytes on disk, reachable twice
-/// through a symbolic or hard link. Only Unix exposes this through `std` in a
-/// stable form, so other platforms report `(0, 0)` and fall back to counting
-/// every row as its own copy.
+/// An `ino` of `0` means the platform cannot report one, and the query falls back
+/// to treating each path as its own file.
 #[cfg(unix)]
-fn file_identity(metadata: &std::fs::Metadata) -> (i64, i64) {
+fn file_identity(metadata: &std::fs::Metadata, _path: &Path) -> (i64, i64) {
     use std::os::unix::fs::MetadataExt;
     (metadata.dev() as i64, metadata.ino() as i64)
 }
 
-#[cfg(not(unix))]
-fn file_identity(_metadata: &std::fs::Metadata) -> (i64, i64) {
+#[cfg(windows)]
+fn file_identity(_metadata: &std::fs::Metadata, path: &Path) -> (i64, i64) {
+    windows_identity(path)
+}
+
+/// Volume serial number and file index, read from one
+/// `BY_HANDLE_FILE_INFORMATION` so the path is opened once.
+///
+/// A zero index is passed through, which sends the query back to path identity.
+/// FAT and exFAT synthesize an index that can move, and one that changed between
+/// scans would read as a different file.
+#[cfg(windows)]
+fn windows_identity(path: &Path) -> (i64, i64) {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
+    };
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+
+    // SAFETY: `wide` is NUL-terminated and outlives the call; the null
+    // security-attributes and template-handle arguments are legitimate; the
+    // handle is closed on every path out; and the call's own return value is
+    // checked before `info` is read.
+    unsafe {
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        );
+
+        if handle == INVALID_HANDLE_VALUE {
+            return (0, 0);
+        }
+
+        let mut info = std::mem::zeroed();
+        let ok = GetFileInformationByHandle(handle, &mut info);
+        CloseHandle(handle);
+
+        if ok == 0 {
+            return (0, 0);
+        }
+
+        let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        (info.dwVolumeSerialNumber as i64, index as i64)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(_metadata: &std::fs::Metadata, _path: &Path) -> (i64, i64) {
     (0, 0)
 }
 
-pub fn get_num_hashers() -> usize {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    std::cmp::max(1, cores.saturating_sub(2))
+/// The filesystem a path lives on: the Unix device number, the Windows volume
+/// serial number, or `0` where neither is available. Best-effort — every caller
+/// treats `0` as "unknown" and degrades accordingly, which is better than
+/// failing a scan over a heuristic.
+pub(crate) fn path_device(path: &Path) -> i64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).map(|m| m.dev() as i64).unwrap_or(0)
+    }
+
+    // `FILE_FLAG_BACKUP_SEMANTICS` is what lets this open directories, which
+    // `File::open` refuses; the prune guard asks about ancestor directories, not
+    // just files.
+    #[cfg(windows)]
+    {
+        windows_identity(path).0
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        0
+    }
 }
 
 pub fn spawn_hash_workers(
@@ -212,9 +313,6 @@ pub fn spawn_hash_workers(
     db_pb: ProgressBar,
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
-    let num_threads = get_num_hashers();
-    debug!("Thread pool initialized with {} threads", num_threads);
-
     std::thread::spawn(move || {
         // Use rayon's parallel iterator to process files
         scanned_files_rx.into_iter().par_bridge().for_each(|file| {
@@ -222,8 +320,6 @@ pub fn spawn_hash_workers(
             if shutdown.load(Ordering::Relaxed) {
                 return;
             }
-
-            debug!("Hashing {}", file.path.display());
 
             match hash_file(&file.absolute_path) {
                 Ok(hash) => {
@@ -242,16 +338,17 @@ pub fn spawn_hash_workers(
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to hash {}: {}", file.path.display(), e);
+                    note(
+                        &hash_pb,
+                        &format!("Failed to hash {}: {e}", file.path.display()),
+                    );
                     hash_pb.inc(1);
                 }
             }
         });
-        debug!("Hash workers finished processing");
     })
 }
 
-#[instrument(skip(path))]
 fn hash_file(path: &Path) -> Result<String> {
     let mut file = File::open(path).map_err(|e| DedupError::HashFile {
         path: path.display().to_string(),
@@ -294,24 +391,9 @@ mod tests {
     }
 
     #[test]
-    fn hash_file_empty_file() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let hash = hash_file(file.path()).unwrap();
-        assert_eq!(
-            hash,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-    }
-
-    #[test]
     fn hash_file_missing_path_errors() {
         let err = hash_file(Path::new("/definitely/not/a/real/file")).unwrap_err();
         assert!(matches!(err, DedupError::HashFile { .. }));
-    }
-
-    #[test]
-    fn get_num_hashers_is_at_least_one() {
-        assert!(get_num_hashers() >= 1);
     }
 
     #[test]

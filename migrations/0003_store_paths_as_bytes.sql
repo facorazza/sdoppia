@@ -1,0 +1,18 @@
+-- Stores paths as bytes rather than text.
+--
+-- A Unix path is an arbitrary byte string, but paths were stored through
+-- `to_string_lossy()`, which replaces invalid UTF-8 with U+FFFD. So `a\xff.txt`
+-- and `a\xfe.txt` both landed as the same string, and since `path` is UNIQUE and
+-- inserts are INSERT OR REPLACE, the second file silently replaced the first:
+-- absent from the database, unreportable as a duplicate, and undercounted.
+--
+-- That bit twice. The stored path also stopped naming anything on disk, so
+-- prune's existence check saw a missing file and deleted the entry every run.
+--
+-- No column change is needed. TEXT affinity leaves BLOB values alone -- it only
+-- coerces numbers to text -- so the rows just have to start out as blobs, which
+-- one UPDATE does. Declaring the column BLOB would read better but would force
+-- a full table rebuild to apply, and buys nothing: comparisons already go
+-- through memcmp either way, which is what lets prune scope a root with a byte
+-- range instead of a LIKE.
+UPDATE hashes SET path = CAST(path AS BLOB);

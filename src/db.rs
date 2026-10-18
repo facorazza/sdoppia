@@ -1,7 +1,7 @@
 use std::{
     fs::File,
     io::{BufWriter, Write},
-    path::Path,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{
         Arc,
@@ -9,30 +9,30 @@ use std::{
     },
 };
 
+use crate::{
+    error::{DedupError, Result},
+    fs,
+    models::{Duplicates, FileMetadata, HashedFile},
+    note,
+    report::{Format, Report},
+};
 use crossbeam_channel::{Receiver, Sender};
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use sqlx::{
     AssertSqlSafe, Row, SqlitePool,
     migrate::Migrator,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
 };
-use tracing::{debug, info, instrument, warn};
-
-use crate::{
-    error::{DedupError, Result},
-    models::{Duplicates, FileMetadata, HashedFile},
-};
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
-#[instrument(skip(db_path))]
 pub async fn init_database(db_path: &Path) -> Result<SqlitePool> {
     if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
 
     let db_url = format!("sqlite:{}", db_path.display());
-    debug!("Connecting to database: {}", db_url);
 
     let options = SqliteConnectOptions::from_str(&db_url)?
         .create_if_missing(true)
@@ -45,42 +45,62 @@ pub async fn init_database(db_path: &Path) -> Result<SqlitePool> {
 
     MIGRATOR.run(&pool).await?;
 
-    debug!("Database initialized successfully");
     Ok(pool)
 }
 
-/// SQL expression identifying the filesystem object a row refers to.
-///
-/// Hard links and symbolic links share an inode, so rows with the same expression
-/// are one object reached by several paths. Where the identity is unknown
-/// (`ino = 0`, meaning the platform does not expose inode data) the path stands
-/// in, so those rows keep counting individually instead of collapsing into one.
-const IDENTITY_EXPR: &str =
-    "CASE WHEN ino = 0 THEN 'p:' || path ELSE 'i:' || dev || ':' || ino END";
+/// SQL expression identifying the filesystem object a row refers to: rows that
+/// match are one object reached by several paths. Where the identity is unknown
+/// the path stands in, so those rows count individually rather than collapsing.
+const IDENTITY_EXPR: &str = "CASE WHEN ino = 0 \
+     THEN 'p:' || CAST(path AS BLOB) ELSE 'i:' || dev || ':' || ino END";
 
-// The queries below are assembled with `format!` purely to inject
-// `IDENTITY_EXPR` and a size filter chosen from a literal. Keeping that
-// expression in one place matters more than avoiding `format!`, because every
-// duplicate and wasted-space metric has to agree on what counts as a copy, and
-// a missed edit here would silently skew the report. No user input reaches any
-// of these strings; scanned paths and sizes travel as bind parameters.
-//
-// `sqlx::AssertSqlSafe` is the documented way to pass a SQL string that is not
-// a compile-time literal. It is sound here for the reason above.
+// `format!` injects only `IDENTITY_EXPR` and a filter chosen from a literal;
+// paths and sizes travel as bind parameters. `AssertSqlSafe` is the documented
+// way to pass a SQL string that is not a compile-time literal.
 
-/// Hashes with more than one distinct filesystem object behind them.
-fn duplicate_groups_query(min_size: i64) -> AssertSqlSafe<String> {
+/// One row per hash holding more than one distinct object, with the number of
+/// objects behind it. The group listing and the totals both read from this, so
+/// the two cannot disagree about what a copy is.
+fn copy_counts_sql(min_size: i64) -> String {
     let filter = if min_size > 0 { "WHERE size >= ?" } else { "" };
+    format!(
+        "SELECT hash, size, COUNT(*) AS paths, COUNT(DISTINCT {IDENTITY_EXPR}) AS copies \
+         FROM hashes {filter} GROUP BY hash HAVING copies > 1"
+    )
+}
+
+fn duplicate_groups_query(min_size: i64) -> AssertSqlSafe<String> {
     AssertSqlSafe(format!(
-        "SELECT hash, size FROM hashes {filter} \
-         GROUP BY hash \
-         HAVING COUNT(DISTINCT {IDENTITY_EXPR}) > 1 \
-         ORDER BY size DESC"
+        "SELECT hash, size FROM ({}) ORDER BY size DESC",
+        copy_counts_sql(min_size)
     ))
 }
 
-/// Every path in a duplicate group, paired with the object it refers to and
-/// ordered so each object's paths are adjacent and deterministic.
+/// Four scalars in one pass. `stats` does not need every path, and building the
+/// report to sum them costs a query per group plus the memory to hold it all.
+///
+/// No `HAVING`: the first two are also the report's figures and a single-object
+/// group contributes zero to both, while the last two cover the whole table and
+/// need the groups a link to a file with no duplicate never gets to join.
+///
+/// Every column is cast back to INTEGER. SQLite promotes an overflowing product
+/// to REAL and `Row::get::<i64>` panics on a REAL rather than erroring. The cast
+/// saturates at `i64::MAX`, so the figure reads as a floor instead of failing the
+/// run; the other three are counts and cannot overflow.
+fn duplicate_totals_query() -> AssertSqlSafe<String> {
+    AssertSqlSafe(format!(
+        "SELECT CAST(COALESCE(SUM(copies - 1), 0) AS INTEGER), \
+                CAST(COALESCE(SUM(CASE WHEN copies > 1 \
+                                     THEN size * (copies - 1) ELSE 0 END), 0) AS INTEGER), \
+                CAST(COALESCE(SUM(paths - copies), 0) AS INTEGER), \
+                CAST(COALESCE(SUM(copies), 0) AS INTEGER) \
+         FROM (SELECT size, COUNT(*) AS paths, COUNT(DISTINCT {IDENTITY_EXPR}) AS copies \
+               FROM hashes GROUP BY hash)"
+    ))
+}
+
+/// Every path in a group, paired with its object. Ordered so each object's
+/// paths are adjacent, which is what `Duplicates::from_paths` relies on.
 fn group_paths_query() -> AssertSqlSafe<String> {
     AssertSqlSafe(format!(
         "SELECT path, {IDENTITY_EXPR} AS identity FROM hashes WHERE hash = ? \
@@ -88,22 +108,247 @@ fn group_paths_query() -> AssertSqlSafe<String> {
     ))
 }
 
-/// Copies beyond the first per hash, summed over all duplicate groups.
-fn redundant_copies_query() -> AssertSqlSafe<String> {
-    AssertSqlSafe(format!(
-        "SELECT COALESCE(SUM(copies - 1), 0) FROM (\
-            SELECT COUNT(DISTINCT {IDENTITY_EXPR}) AS copies \
-            FROM hashes GROUP BY hash HAVING copies > 1)"
-    ))
+/// One page of entries within a root's range, resuming after `cursor`.
+///
+/// Paginated by `path`, not `id`. `path` is UNIQUE, so it is a total order and
+/// the cursor is well defined; deleting a row cannot shift it. Ordering by `id`
+/// instead would force the rowid index and turn the range below into a filter
+/// over the whole table, which is what this exists to avoid.
+fn prune_page_query() -> AssertSqlSafe<String> {
+    AssertSqlSafe(
+        "SELECT id, path, dev FROM hashes \
+         WHERE path >= ? AND path < ? AND path > ? ORDER BY path LIMIT ?"
+            .to_string(),
+    )
 }
 
-/// Reclaimable bytes: every distinct object past the first, links excluded.
-fn wasted_space_query() -> AssertSqlSafe<String> {
-    AssertSqlSafe(format!(
-        "SELECT COALESCE(SUM(size * (copies - 1)), 0) FROM (\
-            SELECT size, COUNT(DISTINCT {IDENTITY_EXPR}) AS copies \
-            FROM hashes GROUP BY hash HAVING copies > 1)"
-    ))
+/// A path as the bytes the `path` column stores and compares.
+///
+/// Native per platform, so nothing is lost either way: raw bytes on Unix,
+/// UTF-16LE on Windows, where the filesystem is UTF-16. The `path` column is
+/// declared TEXT, which does not matter — TEXT affinity leaves blobs alone.
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().into_owned().into_bytes()
+}
+
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        PathBuf::from(std::ffi::OsString::from_wide(&units))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+/// The bytes covering a root and everything under it.
+///
+/// Paths are stored as bytes, so SQLite compares them with `memcmp` and a prefix
+/// match is a range: from the root itself up to the byte after the separator.
+/// That makes `/a/b` cover `/a/b` and `/a/b/...` but not `/a/bc`, and it relies
+/// on nothing but ordering, so no collation or wildcard escaping is involved.
+///
+/// `root` is kept alongside the range because the delete is gated on a scope
+/// check over these same bytes. Deriving it from the range by popping a byte off
+/// the end only worked while the separator was one byte long.
+struct RootRange {
+    lower: Vec<u8>,
+    upper: Vec<u8>,
+    root: Vec<u8>,
+    sep: Vec<u8>,
+}
+
+impl RootRange {
+    fn of(root: &Path) -> Self {
+        // The separator as `path_bytes` writes it: one byte on Unix, two on
+        // Windows where paths are UTF-16LE. Measured by pushing an empty
+        // component, which adds exactly one, so it cannot drift from
+        // `path_bytes`. Hard-coding `/` built a range matching no Windows path,
+        // which made `--prune` a silent no-op there.
+        let head = path_bytes(Path::new("a"));
+        let mut probe = PathBuf::from("a");
+        probe.push("");
+        let sep = path_bytes(&probe)[head.len()..].to_vec();
+
+        Self::new(path_bytes(root), sep)
+    }
+
+    /// Takes the separator separately so the Windows encoding can be exercised
+    /// on any platform.
+    fn new(mut base: Vec<u8>, sep: Vec<u8>) -> Self {
+        while base.len() >= sep.len() && base.ends_with(&sep) {
+            base.truncate(base.len() - sep.len());
+        }
+
+        let mut lower = base.clone();
+        lower.extend_from_slice(&sep);
+
+        // One past the separator's leading byte. Every path continuing past the
+        // root carries that byte there; anything else is a sibling.
+        let mut upper = base.clone();
+        upper.push(sep[0].saturating_add(1));
+
+        RootRange {
+            lower,
+            upper,
+            root: base,
+            sep,
+        }
+    }
+}
+
+/// Whether stored `path` lies under `root`, over the same bytes the range
+/// compared. The delete is gated on this, so it has to agree with the range
+/// exactly rather than approximate it.
+fn in_scope(path: &[u8], root: &RootRange) -> bool {
+    path == root.root
+        || (path.len() > root.root.len()
+            && path.starts_with(&root.root)
+            && path[root.root.len()..].starts_with(&root.sep))
+}
+
+fn delete_id_query() -> AssertSqlSafe<String> {
+    AssertSqlSafe("DELETE FROM hashes WHERE id = ?".to_string())
+}
+
+const PRUNE_PAGE: i64 = 1000;
+
+/// Deletes entries under `roots` whose file is gone.
+///
+/// Keyed on whether the path still exists, never on whether this scan saw it: a
+/// scan cannot reach every file under a root, and "not seen" would delete
+/// entries for files that are sitting there untouched.
+pub async fn prune_missing(
+    pool: &SqlitePool,
+    roots: &[PathBuf],
+    shutdown: &AtomicBool,
+) -> Result<usize> {
+    let pb = spinner();
+    pb.set_message("Checking for removed files...");
+
+    let mut removed = 0usize;
+    let mut checked = 0usize;
+
+    // One pass per root, each a contiguous range of `path`, so a prune of one
+    // small directory reads only that directory's rows.
+    for root in roots {
+        let scope = RootRange::of(root);
+        let mut cursor: Vec<u8> = Vec::new();
+
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                pb.finish_and_clear();
+                return Ok(removed);
+            }
+
+            let rows = sqlx::query(prune_page_query())
+                .bind(&scope.lower)
+                .bind(&scope.upper)
+                .bind(&cursor)
+                .bind(PRUNE_PAGE)
+                .fetch_all(pool)
+                .await?;
+
+            if rows.is_empty() {
+                break;
+            }
+
+            cursor = rows
+                .last()
+                .map(|r| r.get::<Vec<u8>, _>("path"))
+                .unwrap_or(cursor);
+
+            let candidates: Vec<(i64, PathBuf, i64)> = rows
+                .into_iter()
+                .filter_map(|row| {
+                    let id: i64 = row.get("id");
+                    let raw: Vec<u8> = row.get("path");
+                    let dev: i64 = row.get("dev");
+                    in_scope(&raw, &scope).then(|| (id, path_from_bytes(&raw), dev))
+                })
+                .collect();
+
+            let stale: Vec<i64> = candidates
+                .par_iter()
+                .filter(|(_, path, dev)| is_gone(path, *dev))
+                .map(|(id, _, _)| *id)
+                .collect();
+
+            if !stale.is_empty() {
+                // One transaction per page, so an interrupted prune leaves whole
+                // pages deleted and none half-applied.
+                let mut tx = pool.begin().await?;
+                for id in &stale {
+                    sqlx::query(delete_id_query())
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                tx.commit().await?;
+                removed += stale.len();
+            }
+
+            // The bar is a spinner with no length, so `inc` would advance
+            // nothing visible; the running count goes in the message instead,
+            // which is what tells a long prune from a stalled one.
+            checked += candidates.len();
+            pb.set_message(format!("Checked {checked} entries, removed {removed}"));
+        }
+    }
+
+    pb.finish_and_clear();
+    Ok(removed)
+}
+
+/// Whether a stored path is a file that is genuinely gone.
+///
+/// Only `NotFound` counts. A permission problem or any other error keeps the
+/// entry: a stale row costs a few bytes, a dropped live one corrupts the report.
+///
+/// An unmounted volume leaves its mount point directory in place on the parent
+/// filesystem, so everything below it reads as deleted while the data is merely
+/// unreachable. Comparing the recorded device against the one the nearest
+/// surviving ancestor is now on tells the two apart: a deleted file's parent is
+/// on the same volume, an unmounted volume's ancestor is not. With no recorded
+/// device there is no way to tell them apart, so the entry is kept.
+fn is_gone(path: &Path, recorded_dev: i64) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => false,
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => false,
+        Err(_) if recorded_dev == 0 => false,
+        Err(_) => path
+            .ancestors()
+            .skip(1)
+            .find(|a| std::fs::metadata(a).is_ok())
+            .is_some_and(|a| fs::path_device(a) == recorded_dev),
+    }
 }
 
 pub async fn database_writer(
@@ -141,11 +386,13 @@ pub async fn database_writer(
                     // print would be wrong. Fail loudly instead. Batches
                     // committed earlier stay in the database; this one is lost,
                     // and retrying a rejected batch would only fail again.
-                    warn!(
-                        "Batch insert of {} records failed after {} were saved: {}",
-                        batch.len(),
-                        total_inserted,
-                        e
+                    note(
+                        &db_pb,
+                        &format!(
+                            "Batch insert of {} records failed after {} were saved: {e}",
+                            batch.len(),
+                            total_inserted
+                        ),
                     );
                     db_pb.finish_with_message(format!(
                         "Failed after {} saved, {} lost",
@@ -159,7 +406,7 @@ pub async fn database_writer(
 
         // Check for shutdown signal
         if shutdown.load(Ordering::Relaxed) {
-            warn!("Database writer received shutdown signal");
+            note(&db_pb, "Database writer received shutdown signal");
             break;
         }
 
@@ -182,7 +429,7 @@ async fn save_hashes(pool: &SqlitePool, files: &[HashedFile]) -> Result<usize> {
         sqlx::query(
             "INSERT OR REPLACE INTO hashes (path, hash, size, mtime, dev, ino) VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .bind(file.absolute_path.to_string_lossy())
+        .bind(path_bytes(&file.absolute_path))
         .bind(&file.hash)
         .bind(file.size)
         .bind(file.mtime)
@@ -212,7 +459,7 @@ pub async fn filter_files(
     loop {
         // Check for shutdown signal
         if shutdown.load(Ordering::Relaxed) {
-            warn!("Filter received shutdown signal, exiting");
+            note(&filter_pb, "Filter received shutdown signal, exiting");
             break;
         }
 
@@ -227,7 +474,7 @@ pub async fn filter_files(
 
         if !rehash {
             match sqlx::query("SELECT size, mtime FROM hashes WHERE path = ?")
-                .bind(file.absolute_path.to_string_lossy())
+                .bind(path_bytes(&file.absolute_path))
                 .fetch_one(&pool)
                 .await
             {
@@ -251,7 +498,10 @@ pub async fn filter_files(
                     // Dropping the file here would silently shrink the scan,
                     // so record it and fail the run once draining completes.
                     query_errors += 1;
-                    warn!("Database query error for {}: {}", file.path.display(), e);
+                    note(
+                        &filter_pb,
+                        &format!("Database query error for {}: {e}", file.path.display()),
+                    );
                 }
             }
         }
@@ -301,29 +551,42 @@ pub async fn filter_files(
     Ok(sent_count)
 }
 
-#[instrument(skip(pool))]
-pub async fn export_duplicates(
-    pool: &SqlitePool,
-    output: Option<&Path>,
-    min_size: i64,
-    shutdown: Arc<AtomicBool>,
-) -> Result<()> {
-    info!("Finding duplicates...");
-
+/// A spinner for a step that runs on its own, outside the scan's `MultiProgress`.
+///
+/// Such a bar does not reserve a row: it draws wherever the cursor happens to
+/// be and leaves the cursor at the end of its own line. Anything printed next
+/// therefore lands inside that line. `finish_and_clear` erases it instead of
+/// leaving a finished line behind, which is what callers want before writing to
+/// stdout.
+fn spinner() -> ProgressBar {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.green} {msg}")
             .unwrap(),
     );
+    pb.enable_steady_tick(std::time::Duration::from_millis(30));
+    pb
+}
+
+/// Every duplicate group, each already split into copies and links.
+///
+/// `Ok(None)` means the run was interrupted part-way, which callers must not
+/// mistake for a database without duplicates. `stats` does not come through
+/// here: it sums `copy_counts_sql` directly rather than build the groups.
+async fn collect_duplicate_groups(
+    pool: &SqlitePool,
+    min_size: i64,
+    pb: &ProgressBar,
+    shutdown: &AtomicBool,
+) -> Result<Option<Vec<Duplicates>>> {
     pb.set_message("Querying database for duplicates...");
 
     // Checked before the group query, not just inside the loop: on a large
     // database that single query is seconds of uninterruptible work, so waiting
     // for it to finish before noticing would make Ctrl+C feel ignored.
     if shutdown.load(Ordering::Relaxed) {
-        pb.finish_with_message("⚠ Interrupted: report not written");
-        return Ok(());
+        return Ok(None);
     }
 
     // Count distinct filesystem objects per hash, not rows: several paths may
@@ -335,26 +598,6 @@ pub async fn export_duplicates(
     }
 
     let hash_rows = hash_query.fetch_all(pool).await?;
-
-    if hash_rows.is_empty() {
-        pb.finish_with_message("No duplicates found!");
-        // Still write the report so an explicitly requested output file is
-        // always produced, even when there is nothing to report.
-        let output_text = format!(
-            "=== DUPLICATE FILES REPORT ===\nGenerated: {}\nTotal duplicate files: 0\nWasted space: 0 bytes\nDuplicate groups: 0\n",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-        );
-        if let Some(output_path) = output {
-            let file = File::create(output_path)?;
-            let mut writer = BufWriter::new(file);
-            writer.write_all(output_text.as_bytes())?;
-            writer.flush()?;
-            info!("Duplicates exported to: {}", output_path.display());
-        } else {
-            println!("{}", output_text);
-        }
-        return Ok(());
-    }
 
     pb.set_message(format!(
         "Processing {} duplicate groups...",
@@ -370,114 +613,68 @@ pub async fn export_duplicates(
         // take effect. Without this the signal is ignored until the whole
         // report is built.
         if shutdown.load(Ordering::Relaxed) {
-            pb.finish_with_message("⚠ Interrupted: report not written");
-            return Ok(());
+            return Ok(None);
         }
 
         let hash: String = row.get("hash");
         let size: i64 = row.get("size");
 
-        let file_rows = sqlx::query(group_paths_query())
+        // The identity is a comparison key and, where the platform reports none, it
+        // carries raw path bytes. Kept as bytes: decoding it would either panic
+        // on anything that is not valid UTF-8, or lossily fold two paths into
+        // one key and hide a real copy.
+        let paths: Vec<(String, Vec<u8>)> = sqlx::query(group_paths_query())
             .bind(&hash)
             .fetch_all(pool)
-            .await?;
+            .await?
+            .into_iter()
+            .map(|row| {
+                let path = String::from_utf8_lossy(&row.get::<Vec<u8>, _>("path")).into_owned();
+                (path, row.get::<Vec<u8>, _>("identity"))
+            })
+            .collect();
 
-        // Partition the group by filesystem object: the first path seen for an
-        // object is a real copy, and every later path for that same object is
-        // just a link to it, so it is listed separately instead of being
-        // counted as reclaimable space.
-        let mut copies: Vec<String> = Vec::new();
-        let mut aliases: Vec<String> = Vec::new();
-        let mut seen_identities: Vec<String> = Vec::new();
-
-        for row in file_rows {
-            let path: String = row.get("path");
-            let identity: String = row.get("identity");
-            if seen_identities.contains(&identity) {
-                aliases.push(path);
-            } else {
-                seen_identities.push(identity);
-                copies.push(path);
-            }
-        }
-
-        if !copies.is_empty() {
-            duplicate_groups.push(Duplicates {
-                hash,
-                size,
-                files: copies,
-                aliases,
-            });
-        }
+        duplicate_groups.push(Duplicates::from_paths(hash, size, &paths));
         pb.inc(1);
     }
 
-    pb.finish_with_message(format!("Found {} duplicate groups", duplicate_groups.len()));
+    Ok(Some(duplicate_groups))
+}
 
-    let total_duplicate_count: usize = duplicate_groups
-        .iter()
-        .filter(|g| g.is_duplicate())
-        .map(|g| g.copies() - 1)
-        .sum();
-    let total_links: usize = duplicate_groups.iter().map(|g| g.aliases.len()).sum();
-    let wasted_space: i64 = duplicate_groups.iter().map(|g| g.wasted_space()).sum();
+pub async fn export_duplicates(
+    pool: &SqlitePool,
+    output_file: Option<&Path>,
+    format: Format,
+    min_size: i64,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
+    let pb = spinner();
 
-    let mut output_lines = Vec::new();
+    let Some(duplicate_groups) = collect_duplicate_groups(pool, min_size, &pb, &shutdown).await?
+    else {
+        pb.finish_and_clear();
+        return Ok(());
+    };
 
-    output_lines.push("=== DUPLICATE FILES REPORT ===".to_string());
-    output_lines.push(format!(
-        "Generated: {}",
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-    ));
-    output_lines.push(format!("Total duplicate files: {}", total_duplicate_count));
-    output_lines.push(format!(
-        "Wasted space: {}",
-        Duplicates::format_size(wasted_space)
-    ));
-    output_lines.push(format!("Duplicate groups: {}", duplicate_groups.len()));
-    if total_links > 0 {
-        output_lines.push(format!(
-            "Linked paths (share storage, reclaiming none): {}",
-            total_links
-        ));
-    }
-    output_lines.push(String::new());
+    let report = Report::new(&duplicate_groups);
 
-    for (idx, group) in duplicate_groups.iter().enumerate() {
-        output_lines.push(format!("--- Group {} ---", idx + 1));
-        output_lines.push(format!("Hash: {}", group.hash));
-        output_lines.push(format!("Size: {}", Duplicates::format_size(group.size)));
-        output_lines.push(format!("Copies: {}", group.copies()));
-        output_lines.push(format!(
-            "Wasted: {}",
-            Duplicates::format_size(group.wasted_space())
-        ));
-        output_lines.push("Files:".to_string());
+    // Cleared rather than finished: the report follows immediately, and a
+    // finished line would be where its first line lands.
+    pb.finish_and_clear();
 
-        for path in &group.files {
-            output_lines.push(format!("  - {}", path));
+    // Written either way, so an explicitly requested output file is produced even
+    // when there is nothing to report.
+    match output_file {
+        Some(output_path) => {
+            let mut writer = BufWriter::new(File::create(output_path)?);
+            writer.write_all(report.render(format)?.as_bytes())?;
+            writer.flush()?;
+            note(
+                &pb,
+                &format!("Duplicates exported to: {}", output_path.display()),
+            );
         }
-
-        if !group.aliases.is_empty() {
-            output_lines.push("Links to the above (not extra copies):".to_string());
-            for path in &group.aliases {
-                output_lines.push(format!("  - {}", path));
-            }
-        }
-
-        output_lines.push(String::new());
-    }
-
-    let output_text = output_lines.join("\n");
-
-    if let Some(output_path) = output {
-        let file = File::create(output_path)?;
-        let mut writer = BufWriter::new(file);
-        writer.write_all(output_text.as_bytes())?;
-        writer.flush()?;
-        info!("Duplicates exported to: {}", output_path.display());
-    } else {
-        println!("{}", output_text);
+        None => println!("{}", report.render(format)?),
     }
 
     Ok(())
@@ -492,24 +689,29 @@ pub async fn show_stats(pool: &SqlitePool) -> Result<()> {
         .fetch_one(pool)
         .await?;
 
-    // Both duplicate metrics count distinct filesystem objects, so that links
-    // to a file already counted never inflate the numbers reported here.
-    let duplicate_files: i64 = sqlx::query_scalar(redundant_copies_query())
+    // Counted in one pass rather than by building the report, and through the
+    // same copy counts the report uses, so the two agree on what a copy is.
+    let row = sqlx::query(duplicate_totals_query())
         .fetch_one(pool)
         .await?;
 
-    let wasted_space: i64 = sqlx::query_scalar(wasted_space_query())
-        .fetch_one(pool)
-        .await?;
+    // The first two are the report's figures. `objects` is not one of them: it
+    // counts objects across the whole table, where a report totals only its
+    // groups, so it has no place in `Totals`.
+    let redundant_copies = row.get::<i64, _>(0) as usize;
+    let wasted_space = row.get::<i64, _>(1);
+    let objects: i64 = row.get(3);
 
     println!("=== DATABASE STATISTICS ===");
     println!("Total files: {}", total_files);
     println!("Total size: {}", Duplicates::format_size(total_size));
-    println!("Duplicate files: {}", duplicate_files);
+    println!("Duplicate files: {}", redundant_copies);
     println!("Wasted space: {}", Duplicates::format_size(wasted_space));
 
-    if total_files > 0 {
-        let duplicate_percentage = (duplicate_files as f64 / total_files as f64) * 100.0;
+    // Divided by objects rather than paths: a directory full of links is the
+    // same handful of files under many names, not a clean one.
+    if objects > 0 {
+        let duplicate_percentage = (redundant_copies as f64 / objects as f64) * 100.0;
         println!("Duplicate percentage: {:.2}%", duplicate_percentage);
     }
 
@@ -522,6 +724,264 @@ pub async fn clear_database(pool: &SqlitePool) -> Result<()> {
         .await?
         .rows_affected();
 
-    info!("Cleared {} entries from database", rows_deleted);
+    // No bars are drawing for `clear`, so stderr is free.
+    eprintln!("Cleared {rows_deleted} entries from database");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn path_bytes_keeps_bytes_that_are_not_valid_utf8() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        // The conversion that used to run on every write. Two names differing
+        // only in these bytes must not both come back as the same string.
+        let path = Path::new("/files").join(OsStr::from_bytes(b"a\xff.txt"));
+        let bytes = path_bytes(&path);
+        assert!(
+            bytes.windows(2).any(|w| w == [0xff, b'.']),
+            "the 0xFF byte must survive, got {bytes:?}"
+        );
+        assert_ne!(path.to_string_lossy().as_bytes(), bytes.as_slice());
+    }
+
+    /// Asserts both halves of the scoping decision. The range is what the page query
+    /// reads and `in_scope` is what gates the delete; a row in one and not the
+    /// other is pruned wrongly, so they are checked against each other.
+    fn assert_scope(scope: &RootRange, cases: &[(&[u8], bool, bool)]) {
+        for (path, in_range, scoped) in cases {
+            let path: &[u8] = path;
+            let shown = String::from_utf8_lossy(path).into_owned();
+
+            assert_eq!(
+                path >= scope.lower.as_slice() && path < scope.upper.as_slice(),
+                *in_range,
+                "byte range [{:02x?}, {:02x?}) disagreed for {shown:?}",
+                scope.lower,
+                scope.upper
+            );
+            assert_eq!(
+                in_scope(path, scope),
+                *scoped,
+                "scope check disagreed for {shown:?}"
+            );
+        }
+    }
+
+    /// How `path_bytes` writes a path and a separator on Windows.
+    fn utf16(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    /// `path_bytes` writes the Windows separator as `5C 00`.
+    const WIN_SEP: [u8; 2] = [0x5C, 0x00];
+
+    /// The measured separator has to be what actually joins two components.
+    /// Diffing two encodings goes wrong quietly: the difference between `a/b`
+    /// and `a` is `/b`, a "separator" that scopes nothing.
+    #[test]
+    fn separator_is_what_joins_two_components() {
+        let scope = RootRange::of(Path::new("/"));
+
+        let mut joined = PathBuf::from("a");
+        joined.push("b");
+        let encoded = path_bytes(&joined);
+
+        assert_eq!(
+            &encoded[1..encoded.len() - 1],
+            scope.sep,
+            "the measured separator is not what joins two components"
+        );
+        assert_eq!(scope.sep[0], std::path::MAIN_SEPARATOR as u8);
+    }
+
+    /// And the range built from it has to select real paths under a real root,
+    /// through the same code `prune_missing` runs.
+    #[test]
+    fn the_measured_separator_scopes_a_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("deep")).unwrap();
+        let file = dir.path().join("deep").join("f.txt");
+        fs::write(&file, b"x").unwrap();
+
+        let scope = RootRange::of(dir.path());
+        let stored = path_bytes(&file);
+        assert!(
+            in_scope(&stored, &scope),
+            "a file under the root is in scope"
+        );
+        assert!(
+            stored >= scope.lower && stored < scope.upper,
+            "a file under the root falls inside the byte range"
+        );
+
+        // A sibling sharing the prefix, built in the stored encoding rather than
+        // on disk: its component starts with a byte other than the separator.
+        let mut sibling = path_bytes(dir.path());
+        sibling.push(b'x');
+        sibling.push(std::path::MAIN_SEPARATOR as u8);
+        sibling.extend_from_slice(b"f.txt");
+
+        assert!(
+            !in_scope(&sibling, &scope),
+            "a sibling sharing the prefix is not in scope"
+        );
+    }
+
+    #[test]
+    fn unix_separator_scopes_the_root_and_its_children() {
+        let scope = RootRange::new(b"/data/b".to_vec(), b"/".to_vec());
+        assert_scope(
+            &scope,
+            &[
+                (b"/data/b/f.txt", true, true),
+                (b"/data/b/deep/f.txt", true, true),
+                (b"/data/bc/f.txt", false, false),
+                (b"/data/b.txt", false, false),
+                (b"/data/c.txt", false, false),
+                (b"/data", false, false),
+                (b"/data/", false, false),
+            ],
+        );
+    }
+
+    /// The two-byte separator is the case that made `--prune` a silent no-op on
+    /// Windows: a range built around a one-byte `/` selected no path there, so
+    /// nothing was read and nothing was deleted while still reporting that it
+    /// had run. Reproduced everywhere so it does not need a Windows runner.
+    #[test]
+    fn windows_separator_scopes_the_root_and_its_children() {
+        let scope = RootRange::new(utf16("C:\\data\\b"), WIN_SEP.to_vec());
+        assert_scope(
+            &scope,
+            &[
+                (&utf16("C:\\data\\b\\f.txt"), true, true),
+                (&utf16("C:\\data\\b\\deep\\f.txt"), true, true),
+                // A character above U+007F is not valid UTF-8 on its own.
+                (&utf16("C:\\data\\b\\caf\u{e9}.txt"), true, true),
+                (&utf16("C:\\data\\bc\\f.txt"), false, false),
+                (&utf16("C:\\data\\b.txt"), false, false),
+                (&utf16("C:\\data"), false, false),
+                (&utf16("D:\\data\\b\\f.txt"), false, false),
+            ],
+        );
+    }
+
+    /// A trailing separator has to be stripped whole. Popping a single byte left
+    /// the `5C` half behind, which no stored path begins with, so every
+    /// descendant read as out of scope.
+    #[test]
+    fn trailing_separators_are_stripped_whole() {
+        for (given, sep, expected_root, descendant, sibling) in [
+            (
+                b"/data/b/".to_vec(),
+                b"/".to_vec(),
+                b"/data/b".to_vec(),
+                b"/data/b/deep/f.txt".to_vec(),
+                b"/data/bc/f.txt".to_vec(),
+            ),
+            (
+                utf16("C:\\data\\b\\"),
+                WIN_SEP.to_vec(),
+                utf16("C:\\data\\b"),
+                utf16("C:\\data\\b\\f.txt"),
+                utf16("C:\\data\\bc\\f.txt"),
+            ),
+        ] {
+            let scope = RootRange::new(given, sep);
+            assert_eq!(scope.root, expected_root, "root kept a trailing separator");
+            assert!(in_scope(&descendant, &scope), "{descendant:?}");
+            assert!(!in_scope(&sibling, &scope), "{sibling:?}");
+        }
+    }
+
+    /// A hash group whose stored sizes disagree pushes `size * (copies - 1)`
+    /// past `i64::MAX` while the table total stays inside it. The size is
+    /// recorded at scan time and the hash at read time, so a file edited in
+    /// between splits them. SQLite promotes the product to REAL, and reading the
+    /// row as `i64` panicked on it; the cast saturates instead.
+    #[tokio::test]
+    async fn totals_survive_a_size_that_overflows_the_product() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(dir.path().join("overflow.db"))
+            .create_if_missing(true);
+        let pool = SqlitePool::connect_with(options).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+
+        for (i, size) in [9_000_000_000_000_000_000i64, 1, 1].into_iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO hashes (path, hash, size, mtime, dev, ino) \
+                 VALUES (?, ?, ?, 1, 1, ?)",
+            )
+            .bind(path_bytes(Path::new(&format!("/p{i}"))))
+            .bind("same-hash")
+            .bind(size)
+            .bind(100 + i as i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let row = sqlx::query(duplicate_totals_query())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(row.get::<i64, _>(0), 2, "3 objects over one hash");
+        assert_eq!(row.get::<i64, _>(2), 0, "no two paths share an object");
+        assert_eq!(row.get::<i64, _>(3), 3);
+        assert_eq!(
+            row.get::<i64, _>(1),
+            i64::MAX,
+            "an unrepresentable total saturates rather than overflowing"
+        );
+    }
+
+    /// And the casts must be a no-op for ordinary data.
+    #[tokio::test]
+    async fn totals_are_exact_for_ordinary_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(dir.path().join("ordinary.db"))
+            .create_if_missing(true);
+        let pool = SqlitePool::connect_with(options).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+
+        // Two objects of 10 bytes, a link to the first, and a solo file.
+        for (path, hash, size, ino) in [
+            ("/a", "ha", 10i64, 1i64),
+            ("/b", "ha", 10, 2),
+            ("/a_link", "ha", 10, 1),
+            ("/solo", "hb", 7, 3),
+        ] {
+            sqlx::query(
+                "INSERT INTO hashes (path, hash, size, mtime, dev, ino) \
+                 VALUES (?, ?, ?, 1, 1, ?)",
+            )
+            .bind(path_bytes(Path::new(path)))
+            .bind(hash)
+            .bind(size)
+            .bind(ino)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let row = sqlx::query(duplicate_totals_query())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(row.get::<i64, _>(0), 1, "one redundant copy");
+        assert_eq!(row.get::<i64, _>(1), 10, "10 bytes reclaimable");
+        assert_eq!(row.get::<i64, _>(2), 1, "one linked path");
+        assert_eq!(row.get::<i64, _>(3), 3, "three distinct objects");
+    }
 }

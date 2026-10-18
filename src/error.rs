@@ -9,7 +9,7 @@ pub enum DedupError {
         source: std::io::Error,
     },
 
-    #[error("Invalid directory path: {path}")]
+    #[error("Invalid path: {path}")]
     InvalidPath { path: String },
 
     #[error("Failed to read file metadata for '{path}': {source}")]
@@ -40,6 +40,21 @@ pub enum DedupError {
 
     #[error("Failed to read cached hash for {0} file(s) from the database")]
     QueryFailed(usize),
+
+    #[error(
+        "Refusing to {action} without confirmation: stdin is not a terminal, \
+         so there is nobody to ask."
+    )]
+    ConfirmationRequired { action: String },
+
+    #[error("Failed to render the report: {0}")]
+    Render(#[from] serde_json::Error),
+
+    #[error(
+        "Refusing to write the report over '{path}': that is the database. \
+             Choose a different --output-file."
+    )]
+    OutputOverwritesDatabase { path: String },
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

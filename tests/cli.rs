@@ -12,12 +12,35 @@ fn sdoppia_bin() -> &'static str {
     env!("CARGO_BIN_EXE_sdoppia")
 }
 
+/// Refuses to run a command without an explicit `--db`.
+///
+/// The default database is a real file at a fixed, discoverable path, so a test
+/// that forgets `--db` does not quietly use a scratch database — it opens the
+/// user's own, and `clear --yes` against that is unrecoverable. Every test here
+/// passes `--db` already; this makes a future omission a failure here rather
+/// than a surprise much later.
+fn require_explicit_db(args: &[&str]) {
+    assert!(
+        args.iter().any(|a| *a == "--db" || *a == "-d"),
+        "every test must pass --db: {args:?}"
+    );
+}
+
 fn run(args: &[&str]) -> Output {
+    require_explicit_db(args);
     Command::new(sdoppia_bin())
         .args(args)
-        // The binary's tracing filter honors RUST_LOG; keep test output
-        // deterministic regardless of the caller's environment.
-        .env_remove("RUST_LOG")
+        .output()
+        .expect("failed to run sdoppia binary")
+}
+
+/// Same, but from a given working directory, for the cases where the run has no
+/// paths of its own and falls back to wherever it was invoked.
+fn run_in(dir: &Path, args: &[&str]) -> Output {
+    require_explicit_db(args);
+    Command::new(sdoppia_bin())
+        .args(args)
+        .current_dir(dir)
         .output()
         .expect("failed to run sdoppia binary")
 }
@@ -65,7 +88,7 @@ fn scan_nonexistent_path_fails_with_nonzero_exit() {
         stdout(&output)
     );
     assert!(
-        stderr(&output).contains("Invalid directory path"),
+        stderr(&output).contains("Invalid path: /definitely/not/a/real/path"),
         "stderr should report the invalid path, got: {}",
         stderr(&output)
     );
@@ -90,7 +113,7 @@ fn scan_finds_duplicates_and_reports_them() {
         dir.to_str().unwrap(),
         "--db",
         db.to_str().unwrap(),
-        "--output",
+        "--output-file",
         report.to_str().unwrap(),
     ]);
     assert!(output.status.success(), "scan failed: {}", stderr(&output));
@@ -104,6 +127,184 @@ fn scan_finds_duplicates_and_reports_them() {
     assert!(report_text.contains("a.txt"), "{report_text}");
     assert!(report_text.contains("b.txt"), "{report_text}");
     assert!(!report_text.contains("c.txt"), "{report_text}");
+}
+
+/// `--output json` has to parse, with the numbers as numbers rather than the
+/// rounded strings the text report prints, and a report is written even when
+/// there is nothing in it.
+#[test]
+fn json_output_is_machine_readable() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"hello world\n").unwrap();
+    fs::write(dir.join("b.txt"), b"hello world\n").unwrap();
+
+    let db = tmp.path().join("test.db");
+    let report = tmp.path().join("report.json");
+    let scan = run(&[
+        "scan",
+        dir.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--output",
+        "json",
+        "--output-file",
+        report.to_str().unwrap(),
+    ]);
+    assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report).unwrap()).unwrap();
+    assert_eq!(parsed["duplicate_groups"], 1);
+    assert_eq!(parsed["redundant_copies"], 1);
+    assert_eq!(parsed["linked_paths"], 0);
+    assert_eq!(parsed["wasted_space"], 12);
+    assert_eq!(parsed["groups"][0]["copies"], 2);
+    assert_eq!(parsed["groups"][0]["size"], 12);
+    assert!(
+        parsed["groups"][0]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.as_str().unwrap().ends_with("a.txt")),
+        "the copies should be listed by path: {parsed}"
+    );
+
+    // With nothing to report the file must still appear, or a requested output
+    // file is simply never written.
+    fs::remove_file(dir.join("b.txt")).unwrap();
+    fs::write(dir.join("a.txt"), b"changed\n").unwrap();
+    let empty = run(&[
+        "scan",
+        dir.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--output",
+        "json",
+        "--output-file",
+        report.to_str().unwrap(),
+    ]);
+    assert!(empty.status.success(), "scan failed: {}", stderr(&empty));
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report).unwrap()).unwrap();
+    assert_eq!(parsed["duplicate_groups"], 0);
+    assert!(parsed["groups"].as_array().unwrap().is_empty(), "{parsed}");
+}
+/// Three views of one database — text report, JSON report, `stats` — computed
+/// three ways (SQL aggregates, Rust aggregation, and per-group queries). A drift
+/// between them means one of them is lying about the disk.
+#[test]
+fn every_view_of_a_database_agrees() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+
+    // Two groups of two copies, one of them also reached by a hard link.
+    for i in 1..=2 {
+        fs::write(dir.join(format!("a{i}.txt")), format!("hello {i}\n")).unwrap();
+        fs::write(dir.join(format!("b{i}.txt")), format!("hello {i}\n")).unwrap();
+    }
+    fs::hard_link(dir.join("a1.txt"), dir.join("a1_link")).unwrap();
+    fs::write(dir.join("solo.txt"), b"unique\n").unwrap();
+
+    let db = tmp.path().join("test.db");
+    let text_report = tmp.path().join("report.txt");
+    let json_report = tmp.path().join("report.json");
+
+    for (format, path) in [("text", &text_report), ("json", &json_report)] {
+        let scan = run(&[
+            "scan",
+            dir.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+            "--output",
+            format,
+            "--output-file",
+            path.to_str().unwrap(),
+        ]);
+        assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
+    }
+
+    let text = fs::read_to_string(&text_report).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&json_report).unwrap()).unwrap();
+    let stats = stdout(&run(&["stats", "--db", db.to_str().unwrap()]));
+
+    let reported = |label: &str| -> String {
+        stats
+            .lines()
+            .find_map(|l| l.strip_prefix(label))
+            .unwrap_or_else(|| panic!("stats should report {label}, got:\n{stats}"))
+            .trim()
+            .to_string()
+    };
+
+    // Pinned absolutely, so the comparisons below cannot pass vacuously.
+    assert_eq!(json["duplicate_groups"], 2);
+    assert_eq!(json["redundant_copies"], 2);
+    assert_eq!(json["linked_paths"], 1);
+    assert_eq!(json["wasted_space"], 16);
+
+    assert!(text.contains("Duplicate groups: 2"), "{text}");
+    assert!(text.contains("Total duplicate files: 2"), "{text}");
+    assert!(text.contains("Copies: 2"), "{text}");
+    assert!(text.contains("Wasted: 8 bytes"), "{text}");
+
+    assert_eq!(
+        reported("Duplicate files:"),
+        "2",
+        "stats vs report: {stats}"
+    );
+    assert_eq!(
+        reported("Wasted space:"),
+        "16 bytes",
+        "stats vs report: {stats}"
+    );
+}
+
+/// Paths are user data: one containing quotes or a backslash must not corrupt
+/// the JSON around it.
+#[test]
+fn json_output_escapes_awkward_paths() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("we\"ird");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a\"b.txt"), b"hello world\n").unwrap();
+    fs::write(dir.join("c\\d.txt"), b"hello world\n").unwrap();
+
+    let db = tmp.path().join("test.db");
+    let report = tmp.path().join("report.json");
+
+    let output = run(&[
+        "scan",
+        dir.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--output",
+        "json",
+        "--output-file",
+        report.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "scan failed: {}", stderr(&output));
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report).unwrap()).unwrap();
+    let files = parsed["groups"][0]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    assert!(
+        files
+            .iter()
+            .any(|p| p.as_str().unwrap().contains("a\"b.txt")),
+        "quotes should survive round-tripping: {parsed}"
+    );
+    assert!(
+        files
+            .iter()
+            .any(|p| p.as_str().unwrap().contains("c\\d.txt")),
+        "backslashes should survive round-tripping: {parsed}"
+    );
 }
 
 #[test]
@@ -132,7 +333,7 @@ fn stats_and_clear_reflect_database_contents() {
         stdout(&stats)
     );
 
-    let clear = run(&["clear", "--db", db.to_str().unwrap()]);
+    let clear = run(&["clear", "--db", db.to_str().unwrap(), "--yes"]);
     assert!(clear.status.success());
 
     let stats_after = run(&["stats", "--db", db.to_str().unwrap()]);
@@ -211,7 +412,7 @@ fn min_size_filters_small_files_from_report() {
         dir.to_str().unwrap(),
         "--db",
         db.to_str().unwrap(),
-        "--output",
+        "--output-file",
         report.to_str().unwrap(),
         "--min-size",
         "1000000",
@@ -225,24 +426,11 @@ fn min_size_filters_small_files_from_report() {
     );
 }
 
+/// A hard link shares the original's inode, so it is not a separate copy.
+/// Reaching the count wrong means claiming waste that cannot be reclaimed —
+/// so a link must neither inflate the copies nor, on its own, form a group.
 #[test]
-fn db_path_is_respected() {
-    let tmp = TempDir::new().unwrap();
-    let dir = tmp.path().join("files");
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("a.txt"), b"hello world\n").unwrap();
-
-    let db = tmp.path().join("custom.db");
-    let scan = run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()]);
-    assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
-    assert!(Path::new(&db).exists(), "custom db file should exist");
-}
-
-/// Two paths with identical content are only reclaimable waste when they are
-/// distinct objects. A hard link shares the original's inode, so removing one
-/// frees nothing and must not be counted as a copy.
-#[test]
-fn hard_link_is_not_counted_as_a_reclaimable_copy() {
+fn links_are_never_a_reclaimable_copy() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join("files");
     fs::create_dir_all(&dir).unwrap();
@@ -252,13 +440,12 @@ fn hard_link_is_not_counted_as_a_reclaimable_copy() {
 
     let db = tmp.path().join("test.db");
     let report = tmp.path().join("report.txt");
-
     let scan = run(&[
         "scan",
         dir.to_str().unwrap(),
         "--db",
         db.to_str().unwrap(),
-        "--output",
+        "--output-file",
         report.to_str().unwrap(),
     ]);
     assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
@@ -266,44 +453,32 @@ fn hard_link_is_not_counted_as_a_reclaimable_copy() {
     let text = fs::read_to_string(&report).unwrap();
     assert!(
         text.contains("Copies: 2"),
-        "a hard link must not inflate the copy count:\n{text}"
+        "a link must not inflate the count:\n{text}"
     );
     assert!(
         text.contains("Wasted: 5 bytes"),
-        "only the genuinely separate copy is waste:\n{text}"
+        "only the real copy is waste:\n{text}"
     );
     assert!(
         text.contains("a_hardlink"),
-        "the link should still be listed, just not as a copy:\n{text}"
+        "the link should still be listed:\n{text}"
     );
 
-    let stats = run(&["stats", "--db", db.to_str().unwrap()]);
-    assert!(
-        stdout(&stats).contains("Duplicate files: 1"),
-        "stats must agree with the report, got: {}",
-        stdout(&stats)
-    );
-}
+    let stats = stdout(&run(&["stats", "--db", db.to_str().unwrap()]));
+    assert!(stats.contains("Duplicate files: 1"), "{stats}");
 
-/// One file plus links to it is one object, so there is nothing to reclaim and
-/// no duplicate group at all.
-#[test]
-fn links_without_a_second_object_form_no_duplicate_group() {
-    let tmp = TempDir::new().unwrap();
-    let dir = tmp.path().join("files");
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("a.txt"), b"AAAA\n").unwrap();
-    fs::hard_link(dir.join("a.txt"), dir.join("a_hardlink")).unwrap();
-
-    let db = tmp.path().join("test.db");
-    let report = tmp.path().join("report.txt");
-
+    // The same tree without the second copy: one object plus its link is not a
+    // duplicate at all.
+    fs::remove_file(dir.join("b.txt")).unwrap();
+    fs::remove_file(dir.join("a_hardlink")).unwrap();
+    fs::hard_link(dir.join("a.txt"), dir.join("a_link")).unwrap();
+    let second = tmp.path().join("second.db");
     let scan = run(&[
         "scan",
         dir.to_str().unwrap(),
         "--db",
-        db.to_str().unwrap(),
-        "--output",
+        second.to_str().unwrap(),
+        "--output-file",
         report.to_str().unwrap(),
     ]);
     assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
@@ -311,21 +486,11 @@ fn links_without_a_second_object_form_no_duplicate_group() {
     let text = fs::read_to_string(&report).unwrap();
     assert!(
         text.contains("Duplicate groups: 0"),
-        "a file and its own link are not a duplicate pair:\n{text}"
+        "a file and its own link:\n{text}"
     );
-    assert!(text.contains("Total duplicate files: 0"), "{text}");
-
-    let stats = run(&["stats", "--db", db.to_str().unwrap()]);
-    assert!(
-        stdout(&stats).contains("Duplicate files: 0"),
-        "stats must agree with the report, got: {}",
-        stdout(&stats)
-    );
-    assert!(
-        stdout(&stats).contains("Wasted space: 0 bytes"),
-        "stats must agree with the report, got: {}",
-        stdout(&stats)
-    );
+    let stats = stdout(&run(&["stats", "--db", second.to_str().unwrap()]));
+    assert!(stats.contains("Duplicate files: 0"), "{stats}");
+    assert!(stats.contains("Wasted space: 0 bytes"), "{stats}");
 }
 
 /// The stored path must be the one the user asked for, not a symlink-resolved
@@ -349,7 +514,7 @@ fn follow_links_keeps_a_symlink_and_its_target_as_separate_paths() {
         dir.to_str().unwrap(),
         "--db",
         db.to_str().unwrap(),
-        "--output",
+        "--output-file",
         report.to_str().unwrap(),
         "--follow-links",
     ]);
@@ -414,7 +579,7 @@ async fn size_change_forces_rehash_even_when_mtime_matches() {
         dir.to_str().unwrap(),
         "--db",
         db.to_str().unwrap(),
-        "--output",
+        "--output-file",
         report.to_str().unwrap(),
     ]);
     assert!(
@@ -428,6 +593,556 @@ async fn size_change_forces_rehash_even_when_mtime_matches() {
         report_text.contains("Duplicate groups: 1"),
         "b.txt was not rehashed after its size changed, so it was wrongly excluded \
          from the duplicate group. Report:\n{report_text}"
+    );
+}
+
+/// `clear` is the only irreversible command, so it must never run on the
+/// strength of a question nobody answered. A non-interactive stdin (a script, a
+/// cron job, this test harness) cannot be prompted, so the command has to fail
+/// rather than treat the silence as consent.
+#[test]
+fn clear_without_yes_refuses_and_keeps_the_database() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"AAAA\n").unwrap();
+    fs::write(dir.join("b.txt"), b"AAAA\n").unwrap();
+
+    let db = tmp.path().join("test.db");
+    let scan = run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()]);
+    assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
+
+    let clear = run(&["clear", "--db", db.to_str().unwrap()]);
+
+    assert!(
+        !clear.status.success(),
+        "clear must not run unattended, got stdout: {}",
+        stdout(&clear)
+    );
+    assert!(
+        stderr(&clear).contains("--yes"),
+        "the refusal should name the flag that proceeds, got: {}",
+        stderr(&clear)
+    );
+
+    let stats = run(&["stats", "--db", db.to_str().unwrap()]);
+    assert!(
+        stdout(&stats).contains("Total files: 2"),
+        "a refused clear must leave the database untouched, got: {}",
+        stdout(&stats)
+    );
+}
+
+/// A deleted file keeps its entry, and an entry is still reported as a
+/// duplicate for a file that is gone. `--prune` removes exactly those, and
+/// nothing that is still on disk.
+#[test]
+fn prune_removes_only_entries_for_deleted_files() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"hello world\n").unwrap();
+    fs::write(dir.join("b.txt"), b"hello world\n").unwrap();
+    fs::write(dir.join("survivor.txt"), b"kept\n").unwrap();
+
+    let db = tmp.path().join("test.db");
+    assert!(
+        run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()])
+            .status
+            .success()
+    );
+
+    fs::remove_file(dir.join("b.txt")).unwrap();
+    assert!(
+        run(&[
+            "scan",
+            dir.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+            "--prune"
+        ])
+        .status
+        .success()
+    );
+
+    let stats = stdout(&run(&["stats", "--db", db.to_str().unwrap()]));
+    assert!(
+        stats.contains("Total files: 2"),
+        "the two live files must remain: {stats}"
+    );
+    assert!(stats.contains("Duplicate files: 0"), "{stats}");
+    assert!(stats.contains("Wasted space: 0 bytes"), "{stats}");
+}
+/// `Duplicate percentage` is a share of objects, not of paths.
+///
+/// A hard link is another name for a file that is already counted, so ten paths
+/// over here are five objects. Counting the paths would report the tree as half
+/// duplicate when a single copy of one file is redundant.
+#[test]
+fn duplicate_percentage_counts_objects_not_paths() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+
+    // Five objects, each reached by two paths.
+    for i in 1..=5 {
+        fs::write(dir.join(format!("u{i}.txt")), format!("unique {i}\n")).unwrap();
+        fs::hard_link(
+            dir.join(format!("u{i}.txt")),
+            dir.join(format!("u{i}.link")),
+        )
+        .unwrap();
+    }
+    // And exactly one genuine duplicate pair.
+    fs::write(dir.join("d1.txt"), b"dupe\n").unwrap();
+    fs::write(dir.join("d2.txt"), b"dupe\n").unwrap();
+
+    let db = tmp.path().join("test.db");
+    assert!(
+        run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()])
+            .status
+            .success()
+    );
+
+    let stats = stdout(&run(&["stats", "--db", db.to_str().unwrap()]));
+    let reported = |label: &str| -> String {
+        stats
+            .lines()
+            .find_map(|l| l.strip_prefix(label))
+            .unwrap_or_else(|| panic!("stats should report {label}, got:\n{stats}"))
+            .trim()
+            .to_string()
+    };
+
+    // Pinned so the comparison below cannot pass vacuously: 12 paths, 7 objects.
+    assert_eq!(reported("Total files:"), "12", "{stats}");
+    assert_eq!(reported("Duplicate files:"), "1", "{stats}");
+
+    // 1 redundant copy over 7 objects is 14.29%, not 1 over 12 paths.
+    assert_eq!(
+        reported("Duplicate percentage:"),
+        "14.29%",
+        "the denominator should be objects, not paths: {stats}"
+    );
+}
+
+/// Pruning is opt-in. A scan without `--prune` must leave the database exactly
+/// as it found it.
+#[test]
+fn scan_without_prune_keeps_entries_for_deleted_files() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"hello world\n").unwrap();
+    fs::write(dir.join("b.txt"), b"hello world\n").unwrap();
+
+    let db = tmp.path().join("test.db");
+    let scan = run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()]);
+    assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
+
+    fs::remove_file(dir.join("b.txt")).unwrap();
+    let rescan = run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()]);
+    assert!(
+        rescan.status.success(),
+        "rescan failed: {}",
+        stderr(&rescan)
+    );
+
+    let stats = run(&["stats", "--db", db.to_str().unwrap()]);
+    assert!(
+        stdout(&stats).contains("Total files: 2"),
+        "without --prune the stale entry must survive, got: {}",
+        stdout(&stats)
+    );
+}
+
+/// Prune scoping is byte-exact: paths are stored as bytes, SQLite compares it with
+/// `memcmp`, and no collation is involved. A root typed in a different case than
+/// it was scanned therefore matches nothing, even on a case-insensitive
+/// filesystem where it names the same directory.
+///
+/// That is a deliberate trade for storing paths losslessly, and it fails safe:
+/// the entries stay, rather than something live being deleted. Scanned paths
+/// carry the casing the filesystem reported, so this only bites if the case in
+/// the command varies between runs. See README, "Known limitations".
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn prune_scoping_is_byte_exact() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("Documents");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"hello\n").unwrap();
+    fs::write(dir.join("b.txt"), b"hello\n").unwrap();
+
+    let db = tmp.path().join("test.db");
+    assert!(
+        run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()])
+            .status
+            .success()
+    );
+    fs::remove_file(dir.join("b.txt")).unwrap();
+
+    let shouted = dir.to_string_lossy().to_uppercase();
+    let pruned = run(&["scan", &shouted, "--db", db.to_str().unwrap(), "--prune"]);
+    assert!(
+        pruned.status.success(),
+        "prune scan failed: {}",
+        stderr(&pruned)
+    );
+
+    let pool = open_db(&db, false).await;
+    let paths: Vec<Vec<u8>> = sqlx::query_scalar("SELECT path FROM hashes")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    assert!(
+        paths.iter().any(|p| p.ends_with(b"b.txt")),
+        "a differently-cased root is out of scope, so the stale entry survives: {paths:?}"
+    );
+
+    // The same root, spelled as it was scanned, does prune it.
+    let pruned = run(&[
+        "scan",
+        dir.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--prune",
+    ]);
+    assert!(
+        pruned.status.success(),
+        "prune scan failed: {}",
+        stderr(&pruned)
+    );
+
+    let pool = open_db(&db, false).await;
+    let paths: Vec<Vec<u8>> = sqlx::query_scalar("SELECT path FROM hashes")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    assert!(
+        !paths.iter().any(|p| p.ends_with(b"b.txt")),
+        "the entry for the deleted file should be gone: {paths:?}"
+    );
+}
+
+/// An unmounted volume leaves its mount point directory on the parent
+/// filesystem, so every path below it reads as deleted while the data is merely
+/// unreachable. Pruning those would silently under-count the report.
+///
+/// A real mount cannot be created in a test, but the signal the guard reads is
+/// the device recorded on the row, so fabricating one exercises exactly the
+/// branch an unmount would take. The file has to be *gone* for the guard to be
+/// reached at all.
+#[tokio::test]
+async fn prune_keeps_entries_whose_volume_is_not_mounted() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"hello world\n").unwrap();
+
+    let db = tmp.path().join("test.db");
+    let scan = run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()]);
+    assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
+
+    // Gone from disk, but recorded against a volume that is no longer mounted:
+    // identical to what an unmounted mount point leaves behind.
+    fs::remove_file(dir.join("a.txt")).unwrap();
+
+    let pool = open_db(&db, false).await;
+    sqlx::query("UPDATE hashes SET dev = ?")
+        .bind(i64::MAX)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let pruned = run(&[
+        "scan",
+        dir.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--prune",
+    ]);
+    assert!(
+        pruned.status.success(),
+        "prune scan failed: {}",
+        stderr(&pruned)
+    );
+
+    let pool = open_db(&db, false).await;
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM hashes")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    assert_eq!(
+        remaining, 1,
+        "an entry whose volume is unreachable must not be pruned away"
+    );
+}
+
+/// stdout exists for the report and nothing else: anything else logged there
+/// would corrupt a JSON report being piped into another program.
+#[test]
+fn json_report_on_stdout_is_parseable() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"hello world\n").unwrap();
+    fs::write(dir.join("b.txt"), b"hello world\n").unwrap();
+
+    let db = tmp.path().join("test.db");
+    let output = run(&[
+        "scan",
+        dir.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--output",
+        "json",
+        "--prune",
+    ]);
+    assert!(output.status.success(), "scan failed: {}", stderr(&output));
+
+    let parsed: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap_or_else(|e| {
+        panic!(
+            "stdout must be nothing but JSON, but it did not parse: {e}\n--- stdout ---\n{}",
+            stdout(&output)
+        )
+    });
+    assert_eq!(parsed["duplicate_groups"], 1);
+}
+
+/// A subtree the walk cannot enter is a hole in the scan. Silently dropping it
+/// would let the run describe the tree as fully covered, so it is reported.
+#[cfg(unix)]
+#[test]
+fn scan_reports_paths_it_could_not_read() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    let locked = dir.join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(dir.join("a.txt"), b"AAAA\n").unwrap();
+    fs::write(locked.join("hidden.txt"), b"BBBB\n").unwrap();
+
+    // Restore the mode afterwards so the temp dir can be cleaned up.
+    let mut perms = fs::metadata(&locked).unwrap().permissions();
+    perms.set_mode(0o000);
+    fs::set_permissions(&locked, perms).unwrap();
+
+    let db = tmp.path().join("test.db");
+    let output = run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()]);
+
+    let mut perms = fs::metadata(&locked).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&locked, perms).unwrap();
+
+    // The run itself still succeeds — the readable part was scanned — but the
+    // gap is surfaced rather than hidden.
+    assert!(output.status.success(), "scan failed: {}", stderr(&output));
+    assert!(
+        stderr(&output).contains("unreadable"),
+        "the unreadable subtree should be reported, got: {}",
+        stderr(&output)
+    );
+}
+
+/// The prune walks the table a page at a time, advancing past each page by the
+/// highest id it saw. A row beyond the first page is only reached if that
+/// bookkeeping is right, and getting it wrong would stop the prune silently
+/// after one page rather than fail.
+#[test]
+fn prune_reaches_past_the_first_page() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+
+    // Comfortably more than one page of entries.
+    for i in 0..1100 {
+        fs::write(dir.join(format!("f{i}.txt")), b"hello world\n").unwrap();
+    }
+
+    let db = tmp.path().join("test.db");
+    let scan = run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()]);
+    assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
+
+    for i in 0..1100 {
+        fs::remove_file(dir.join(format!("f{i}.txt"))).unwrap();
+    }
+    fs::write(dir.join("survivor.txt"), b"still here\n").unwrap();
+
+    let pruned = run(&[
+        "scan",
+        dir.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--prune",
+    ]);
+    assert!(
+        pruned.status.success(),
+        "prune scan failed: {}",
+        stderr(&pruned)
+    );
+
+    let stats = run(&["stats", "--db", db.to_str().unwrap()]);
+    assert!(
+        stdout(&stats).contains("Total files: 1"),
+        "every deleted entry should be pruned, including past the first page, got: {}",
+        stdout(&stats)
+    );
+}
+
+/// `scan` with no paths means "here", which is the only sensible reading of a
+/// command that is otherwise just sitting in a directory.
+#[test]
+fn scan_without_paths_scans_the_current_directory() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"hello world\n").unwrap();
+    fs::write(dir.join("b.txt"), b"hello world\n").unwrap();
+
+    // The database lives outside the directory being scanned, so the run cannot
+    // pick up its own files.
+    let db = tmp.path().join("test.db");
+    let output = run_in(&dir, &["scan", "--db", db.to_str().unwrap()]);
+    assert!(output.status.success(), "scan failed: {}", stderr(&output));
+
+    let stats = run(&["stats", "--db", db.to_str().unwrap()]);
+    assert!(
+        stdout(&stats).contains("Total files: 2"),
+        "the working directory's files should have been scanned, got: {}",
+        stdout(&stats)
+    );
+    assert!(
+        stdout(&stats).contains("Duplicate files: 1"),
+        "got: {}",
+        stdout(&stats)
+    );
+}
+
+/// The default has to survive alongside `--prune`, which compares stored paths
+/// against the roots it was given. A `.` that is not resolved the same way as
+/// the scanner resolves it would match nothing.
+#[test]
+fn prune_without_paths_uses_the_current_directory_as_the_root() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"hello world\n").unwrap();
+
+    let db = tmp.path().join("test.db");
+    let scan = run_in(&dir, &["scan", "--db", db.to_str().unwrap()]);
+    assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
+
+    fs::remove_file(dir.join("a.txt")).unwrap();
+    let pruned = run_in(&dir, &["scan", "--db", db.to_str().unwrap(), "--prune"]);
+    assert!(
+        pruned.status.success(),
+        "prune scan failed: {}",
+        stderr(&pruned)
+    );
+
+    let stats = run(&["stats", "--db", db.to_str().unwrap()]);
+    assert!(
+        stdout(&stats).contains("Total files: 0"),
+        "`--prune` with no paths should scope to the working directory, got: {}",
+        stdout(&stats)
+    );
+}
+
+/// The database and its `-wal`/`-shm` side files must never be scanned.
+///
+/// Compared against both spellings of the path, because the scanner stores
+/// `std::path::absolute(entry)`: that resolves a relative path through a
+/// `getcwd` with symlinks resolved but leaves an absolute one alone, so on
+/// macOS `/var/...` and `/private/var/...` name one file under two names and a
+/// comparison against only the given spelling would match nothing.
+#[tokio::test]
+async fn the_database_does_not_scan_itself() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"hello world\n").unwrap();
+    fs::write(dir.join("b.txt"), b"hello world\n").unwrap();
+
+    let db = dir.join("sdoppia.db");
+    // Twice: the database is empty after the first run and only has content to
+    // be mistaken for on the second.
+    for _ in 0..2 {
+        let out = run_in(&dir, &["scan", "--db", db.to_str().unwrap()]);
+        assert!(out.status.success(), "scan failed: {}", stderr(&out));
+    }
+
+    let pool = open_db(&db, false).await;
+    // paths are stored as bytes; decoded only for the assertion messages below.
+    let paths: Vec<Vec<u8>> = sqlx::query_scalar("SELECT path FROM hashes")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    assert_eq!(
+        paths.len(),
+        2,
+        "only the two real files should be stored: {paths:?}"
+    );
+}
+
+/// The guard itself. `require_explicit_db` panics before the binary is ever
+/// spawned, so this does not touch any database — if it ever did, the database
+/// it would have touched is the one this test exists to protect.
+#[test]
+#[should_panic(expected = "every test must pass --db")]
+fn a_test_cannot_reach_the_default_database() {
+    run(&["stats"]);
+}
+
+/// `--output-file` truncates its destination, so pointing it at the database
+/// replaces the only copy of every hash with a text file. That is silent and
+/// unrecoverable, so the run is refused instead.
+#[test]
+fn the_report_is_not_written_over_the_database() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"hello world\n").unwrap();
+    fs::write(dir.join("b.txt"), b"hello world\n").unwrap();
+
+    let db = tmp.path().join("test.db");
+    let scan = run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()]);
+    assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
+
+    let clobber = run(&[
+        "scan",
+        dir.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--output-file",
+        db.to_str().unwrap(),
+    ]);
+
+    assert!(
+        !clobber.status.success(),
+        "writing the report over the database must fail, got: {}",
+        stdout(&clobber)
+    );
+    assert!(
+        stderr(&clobber).contains("that is the database"),
+        "the refusal should say why, got: {}",
+        stderr(&clobber)
+    );
+
+    let stats = run(&["stats", "--db", db.to_str().unwrap()]);
+    assert!(
+        stdout(&stats).contains("Total files: 2"),
+        "the database must survive the attempt, got: {}",
+        stdout(&stats)
     );
 }
 
@@ -474,7 +1189,7 @@ async fn scan_fails_when_database_writes_fail() {
         dir.to_str().unwrap(),
         "--db",
         db.to_str().unwrap(),
-        "--output",
+        "--output-file",
         report.to_str().unwrap(),
     ]);
 
@@ -503,4 +1218,151 @@ async fn scan_fails_when_database_writes_fail() {
         "the aborted batch must leave the setup rows untouched"
     );
     pool.close().await;
+}
+
+/// The reason paths are stored as bytes: two names differing only in bytes that are not
+/// valid UTF-8 used to lossy-convert to one stored string, and since the column
+/// is UNIQUE the second file silently replaced the first.
+///
+/// macOS cannot create such a file -- APFS requires valid UTF-8 -- so the rows
+/// are planted directly. This covers the column keeping distinct bytes distinct;
+/// `path_bytes` itself is covered by a unit test, and scanning a genuinely
+/// non-UTF-8 filename end to end still needs a Linux run.
+#[tokio::test]
+async fn paths_that_differ_only_in_invalid_utf8_stay_distinct() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    let db = tmp.path().join("test.db");
+
+    let scan = run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()]);
+    assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
+
+    let pool = open_db(&db, false).await;
+    for raw in [b"/files/a\xff.txt".to_vec(), b"/files/a\xfe.txt".to_vec()] {
+        sqlx::query(
+            "INSERT INTO hashes (path, hash, size, mtime, dev, ino) \
+             VALUES (?, ?, 1, 1, 1, 0)",
+        )
+        .bind(raw.clone())
+        .bind(format!("h{}", raw.len()))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let stored: Vec<Vec<u8>> = sqlx::query_scalar("SELECT path FROM hashes ORDER BY path")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    assert_eq!(
+        stored.len(),
+        2,
+        "the two names must not collapse: {stored:?}"
+    );
+    assert!(
+        stored.iter().any(|p| p.contains(&0xff)) && stored.iter().any(|p| p.contains(&0xfe)),
+        "the original bytes must survive storage: {stored:?}"
+    );
+}
+
+/// A `SIGTERM` asks for the same graceful stop `Ctrl+C` does.
+///
+/// `kill`, systemd, Docker and Kubernetes all stop a process with `SIGTERM`, so
+/// without it the graceful path is unreachable in exactly the deployments that
+/// shut processes down deliberately: the process dies on the spot, mid-scan,
+/// with nothing said and nothing to distinguish it from a crash. `SIGTERM` does
+/// not exist outside Unix.
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_stops_a_scan_gracefully_like_ctrl_c() {
+    // Local, not in the crate imports: `Stdio` is used by nothing else, and the
+    // import at the top would be unused on the platforms this test is not for.
+    use std::process::Stdio;
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+
+    // Sized so the scan is still running when the signal arrives. The signal is
+    // sent as soon as the first row lands, roughly 30ms in, leaving the rest of
+    // the scan as margin -- so this holds on a much faster machine than the one
+    // it was written on. Raise the count if it ever becomes the flaky test.
+    for i in 0..15_000 {
+        fs::write(dir.join(format!("f{i}.bin")), b"x".repeat(2048)).unwrap();
+    }
+
+    let db = tmp.path().join("test.db");
+    let mut child = Command::new(sdoppia_bin())
+        .args(["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to run sdoppia binary");
+
+    // Wait for the run to reach the database writer rather than sleeping a
+    // guessed interval: the signal only proves anything if it lands mid-scan.
+    // The file itself appears first, so that is waited for too -- a run that has
+    // not created its database yet has not started scanning either.
+    for _ in 0..500 {
+        if db.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    assert!(db.exists(), "the scan never created its database");
+
+    let pool = open_db(&db, false).await;
+    let mut started = false;
+    for _ in 0..500 {
+        // The file appears before the migration that creates the table, so an
+        // error here means "not ready yet" rather than a broken run.
+        let rows = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM hashes")
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(0);
+        if rows > 0 {
+            started = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    pool.close().await;
+    assert!(started, "the scan never reached the database writer");
+
+    // `kill` rather than `libc::kill`: it needs no new dependency, and it is
+    // exactly the command an operator or a service manager would run.
+    let signalled = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(
+        signalled && child.try_wait().unwrap().is_none(),
+        "the scan finished before SIGTERM could reach it; raise the file count"
+    );
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "an interrupted scan exits 130, whatever asked it to stop: {}",
+        stderr(&output)
+    );
+
+    // A partial scan must not look like a clean one: the report is the whole
+    // point of the run, and printing one from half a scan would send someone to
+    // delete files on the strength of it.
+    assert!(
+        stdout(&output).is_empty(),
+        "an interrupted scan prints no report: {}",
+        stdout(&output)
+    );
+    assert!(
+        stderr(&output).contains("Received SIGTERM"),
+        "stderr should say what stopped it: {}",
+        stderr(&output)
+    );
 }

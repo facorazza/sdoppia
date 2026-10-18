@@ -57,7 +57,15 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ github.repository }}-${{ github.ref_name }}
 
   test:
-    runs-on: ubuntu-latest
+    # The tool documents behaviour that only exists off Unix — identity is
+    # unknown there, so every path counts as its own copy — and `file_identity`
+    # has a `#[cfg(not(unix))]` arm that nothing else would ever compile.
+    # fail-fast is off so one platform failing still reports the others.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -80,6 +88,37 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
+      - name: Store cache
+        id: store-cache
+        if: success() || failure()
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo
+            target
+          key: ${{ runner.os }}-cargo-${{ github.repository }}-${{ github.ref_name }}
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Restore cache
+        id: restore-cache
+        continue-on-error: true
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo
+            target
+          key: ${{ runner.os }}-cargo-${{ github.repository }}-${{ github.ref_name }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ github.repository }}-
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Build release
         run: cargo build --release --verbose
 
@@ -98,6 +137,10 @@ jobs:
 
   publish-crates-io:
     runs-on: ubuntu-latest
+    # Publishing is irreversible and a version can never be replaced, only
+    # yanked, so it waits on the whole matrix and on the release build rather
+    # than running alongside them.
+    needs: [test, package]
     if: github.ref_type == 'tag'
     steps:
       - name: Checkout code
@@ -113,7 +156,7 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, package]
     if: github.ref_type == 'tag'
     permissions:
       contents: write
