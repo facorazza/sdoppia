@@ -789,12 +789,19 @@ mod tests {
     fn separator_is_what_joins_two_components() {
         let scope = RootRange::of(Path::new("/"));
 
-        let mut joined = PathBuf::from("a");
+        let left = PathBuf::from("a");
+        let mut joined = left.clone();
         joined.push("b");
         let encoded = path_bytes(&joined);
 
+        // The separator sits between the components, so shaving off one byte
+        // per side only works while components are one byte long. Measure the
+        // widths the way `RootRange::of` does — one byte on Unix, two on
+        // Windows' UTF-16LE.
+        let head = path_bytes(&left).len();
+        let tail = path_bytes(Path::new("b")).len();
         assert_eq!(
-            &encoded[1..encoded.len() - 1],
+            &encoded[head..encoded.len() - tail],
             scope.sep,
             "the measured separator is not what joins two components"
         );

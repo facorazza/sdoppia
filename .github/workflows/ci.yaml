@@ -18,7 +18,7 @@ env:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -64,7 +64,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-24.04, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout code
@@ -99,7 +99,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ github.repository }}-${{ github.ref_name }}
 
   package:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -136,7 +136,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ github.repository }}-${{ github.ref_name }}
 
   publish-crates-io:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Publishing is irreversible and a version can never be replaced, only
     # yanked, so it waits on the whole matrix and on the release build rather
     # than running alongside them.
@@ -155,7 +155,7 @@ jobs:
         run: cargo publish
 
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [test, package]
     if: github.ref_type == 'tag'
     permissions:
