@@ -629,7 +629,13 @@ async fn collect_duplicate_groups(
             .await?
             .into_iter()
             .map(|row| {
-                let path = String::from_utf8_lossy(&row.get::<Vec<u8>, _>("path")).into_owned();
+                // The report needs text, so the stored bytes go back through a
+                // real path first: raw bytes on Unix, UTF-16LE on Windows.
+                // Decoding them as UTF-8 read Windows paths with NUL between
+                // every character and could not even hash-group those bytes.
+                let path = path_from_bytes(&row.get::<Vec<u8>, _>("path"))
+                    .to_string_lossy()
+                    .into_owned();
                 (path, row.get::<Vec<u8>, _>("identity"))
             })
             .collect();

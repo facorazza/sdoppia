@@ -264,15 +264,23 @@ fn every_view_of_a_database_agrees() {
     );
 }
 
-/// Paths are user data: one containing quotes or a backslash must not corrupt
-/// the JSON around it.
+/// Paths are user data: a name containing awkward characters must not corrupt
+/// the JSON around it. JSON escapes a quote and a backslash, which are exactly
+/// the two characters Windows cannot store inside a name — a quote is invalid
+/// there and a backslash is the separator — so Windows exercises other
+/// characters the command line and JSON both have opinions about instead.
 #[test]
 fn json_output_escapes_awkward_paths() {
+    #[cfg(windows)]
+    let (first, second) = ("^", "&");
+    #[cfg(not(windows))]
+    let (first, second) = ("\"", "\\");
+
     let tmp = TempDir::new().unwrap();
-    let dir = tmp.path().join("we\"ird");
+    let dir = tmp.path().join(format!("we{first}ird"));
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("a\"b.txt"), b"hello world\n").unwrap();
-    fs::write(dir.join("c\\d.txt"), b"hello world\n").unwrap();
+    fs::write(dir.join(format!("a{first}b.txt")), b"hello world\n").unwrap();
+    fs::write(dir.join(format!("c{second}d.txt")), b"hello world\n").unwrap();
 
     let db = tmp.path().join("test.db");
     let report = tmp.path().join("report.json");
@@ -296,14 +304,14 @@ fn json_output_escapes_awkward_paths() {
     assert!(
         files
             .iter()
-            .any(|p| p.as_str().unwrap().contains("a\"b.txt")),
-        "quotes should survive round-tripping: {parsed}"
+            .any(|p| p.as_str().unwrap().contains(&format!("a{first}b.txt"))),
+        "the first awkward name should survive round-tripping: {parsed}"
     );
     assert!(
         files
             .iter()
-            .any(|p| p.as_str().unwrap().contains("c\\d.txt")),
-        "backslashes should survive round-tripping: {parsed}"
+            .any(|p| p.as_str().unwrap().contains(&format!("c{second}d.txt"))),
+        "the second awkward name should survive round-tripping: {parsed}"
     );
 }
 
