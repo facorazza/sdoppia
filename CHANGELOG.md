@@ -5,6 +5,20 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A rescan now refreshes a stored `(device, inode)` identity when it no longer
+  matches the file. Device numbers are reassigned when a volume is mounted
+  again, and a cache hit never rewrote the row, so a hard link created after
+  the change was recorded with the current number while the original kept the
+  old one: one object counted as two copies, claiming reclaimable space that
+  deleting the link would not free. The cached hash is still reused; only the
+  identity is rewritten, and only when it differs. This also fills in the
+  volume for entries recorded by sdoppia 0.8 on Windows, which no longer need
+  `--rehash` before `--prune` can remove them.
+
 ## [0.9.1] — 2026-10-22
 
 ### Fixed

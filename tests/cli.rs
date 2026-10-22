@@ -604,6 +604,69 @@ async fn size_change_forces_rehash_even_when_mtime_matches() {
     );
 }
 
+/// A volume mounted again can report a different device number, and a cache hit
+/// used to leave the stored one in place. A hard link created after that change
+/// was then recorded with the current number while the original kept the old
+/// one, so one object was read as two copies and the report claimed space that
+/// removing the link would not free.
+#[cfg(any(unix, windows))]
+#[test]
+fn rescan_refreshes_a_changed_identity() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"AAAA\n").unwrap();
+
+    let db = tmp.path().join("test.db");
+    let report = tmp.path().join("report.txt");
+    let scan = run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()]);
+    assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
+
+    // What a remount under a new number leaves behind: the row names a device
+    // the file is not on any more.
+    let pool = open_db(&db, false).await;
+    sqlx::query("UPDATE hashes SET dev = dev + 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    // A second name for the same object, recorded with the current number.
+    fs::hard_link(dir.join("a.txt"), dir.join("b.txt")).unwrap();
+
+    let rescan = run(&[
+        "scan",
+        dir.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--output-file",
+        report.to_str().unwrap(),
+    ]);
+    assert!(
+        rescan.status.success(),
+        "rescan failed: {}",
+        stderr(&rescan)
+    );
+
+    let text = fs::read_to_string(&report).unwrap();
+    assert!(
+        text.contains("Duplicate groups: 0"),
+        "one object reached by two names is not a duplicate:\n{text}"
+    );
+
+    let pool = open_db(&db, false).await;
+    let identities: Vec<(i64, i64)> = sqlx::query_as("SELECT DISTINCT dev, ino FROM hashes")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    assert_eq!(
+        identities.len(),
+        1,
+        "both paths must carry the identity the rescan saw: {identities:?}"
+    );
+}
+
 /// `clear` is the only irreversible command, so it must never run on the
 /// strength of a question nobody answered. A non-interactive stdin (a script, a
 /// cron job, this test harness) cannot be prompted, so the command has to fail

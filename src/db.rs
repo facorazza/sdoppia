@@ -477,7 +477,7 @@ pub async fn filter_files(
         };
 
         if !rehash {
-            match sqlx::query("SELECT size, mtime FROM hashes WHERE path = ?")
+            match sqlx::query("SELECT size, mtime, dev, ino FROM hashes WHERE path = ?")
                 .bind(path_bytes(&file.absolute_path))
                 .fetch_one(&pool)
                 .await
@@ -492,6 +492,25 @@ pub async fn filter_files(
                     // git checkout, or a second edit within the same second) is
                     // invisible to us and would keep a stale hash forever.
                     if stored_size == file.size && stored_mtime == file.mtime {
+                        // The hash is still right, the identity may not be. Device
+                        // numbers are reassigned when a volume is mounted again,
+                        // and a new link recorded after that would get the current
+                        // number while this row kept the old one: one object read
+                        // as two copies, claiming space deleting the link cannot
+                        // free. Never replace a known identity with an unknown
+                        // one, which is what a platform without inode data reports.
+                        let stored_dev: i64 = row.get("dev");
+                        let stored_ino: i64 = row.get("ino");
+                        if (file.dev != 0 || file.ino != 0)
+                            && (file.dev != stored_dev || file.ino != stored_ino)
+                        {
+                            sqlx::query("UPDATE hashes SET dev = ?, ino = ? WHERE path = ?")
+                                .bind(file.dev)
+                                .bind(file.ino)
+                                .bind(path_bytes(&file.absolute_path))
+                                .execute(&pool)
+                                .await?;
+                        }
                         cached_count += 1;
                         continue;
                     }

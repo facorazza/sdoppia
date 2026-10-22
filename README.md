@@ -227,6 +227,11 @@ Windows the volume serial number and file index are read from a
 exFAT synthesize one, and a synthesized value can move — identity falls back to
 the path, and hard links on such a volume may be reported as duplicates.
 
+Identity is refreshed whenever a rescan finds it stale. A volume mounted again
+can report a different device number, and without that refresh a hard link
+created after the change would be stored with the new number while the original
+kept the old one — the same object counted as two copies.
+
 ## How it works
 
 1. **Scan** — walk the given paths and collect file metadata (path, size,
@@ -282,11 +287,12 @@ that no longer exists costs a report that never stops naming it.
 Where a platform cannot report which filesystem a file is on, entries are never
 pruned, since there would be no way to tell a deletion from an unmount. That
 also covers entries recorded by sdoppia 0.8 and earlier on Windows, where the
-volume was not stored: they keep their old value because an unchanged file is
-not rewritten by a rescan. Re-hashing repopulates them:
+volume was not stored. A rescan fills it in: a cache hit refreshes an identity
+that differs from the one on disk, without rehashing, so the next scan prunes
+those entries:
 
 ```shell
-sdoppia scan ~/Documents --prune --rehash
+sdoppia scan ~/Documents --prune
 ```
 
 ## Design trade-offs
