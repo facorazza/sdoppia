@@ -610,8 +610,8 @@ async fn size_change_forces_rehash_even_when_mtime_matches() {
 /// one, so one object was read as two copies and the report claimed space that
 /// removing the link would not free.
 #[cfg(any(unix, windows))]
-#[test]
-fn rescan_refreshes_a_changed_identity() {
+#[tokio::test]
+async fn rescan_refreshes_a_changed_identity() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join("files");
     fs::create_dir_all(&dir).unwrap();
