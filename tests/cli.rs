@@ -836,16 +836,14 @@ async fn prune_scoping_is_byte_exact() {
     );
 }
 
-/// An unmounted volume leaves its mount point directory on the parent
-/// filesystem, so every path below it reads as deleted while the data is merely
-/// unreachable. Pruning those would silently under-count the report.
-///
-/// A real mount cannot be created in a test, but the signal the guard reads is
-/// the device recorded on the row, so fabricating one exercises exactly the
-/// branch an unmount would take. The file has to be *gone* for the guard to be
-/// reached at all.
+/// What a device number means depends on the platform: Unix reassigns it per
+/// boot, so a mismatch with the surviving ancestor must not save a deleted
+/// entry; a Windows volume serial survives a remount, so the same mismatch is an
+/// unmounted volume and the entry must stay. A real mount cannot be created in a
+/// test, but the device on the row is the only signal the guard reads, and the
+/// file is gone, which is what reaches it.
 #[tokio::test]
-async fn prune_keeps_entries_whose_volume_is_not_mounted() {
+async fn a_stale_device_number_does_not_keep_a_deleted_file_by_itself() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join("files");
     fs::create_dir_all(&dir).unwrap();
@@ -855,8 +853,8 @@ async fn prune_keeps_entries_whose_volume_is_not_mounted() {
     let scan = run(&["scan", dir.to_str().unwrap(), "--db", db.to_str().unwrap()]);
     assert!(scan.status.success(), "scan failed: {}", stderr(&scan));
 
-    // Gone from disk, but recorded against a volume that is no longer mounted:
-    // identical to what an unmounted mount point leaves behind.
+    // Gone from disk, recorded against a device the surviving ancestor does not
+    // report: a renumbered device on Unix, an unmounted volume on Windows.
     fs::remove_file(dir.join("a.txt")).unwrap();
 
     let pool = open_db(&db, false).await;
@@ -887,9 +885,15 @@ async fn prune_keeps_entries_whose_volume_is_not_mounted() {
         .unwrap();
     pool.close().await;
 
+    #[cfg(windows)]
     assert_eq!(
         remaining, 1,
         "an entry whose volume is unreachable must not be pruned away"
+    );
+    #[cfg(not(windows))]
+    assert_eq!(
+        remaining, 0,
+        "a deleted file recorded under an earlier device number must be pruned"
     );
 }
 

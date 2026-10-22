@@ -230,8 +230,11 @@ fn file_identity(_metadata: &std::fs::Metadata, path: &Path) -> (i64, i64) {
 /// A zero index is passed through, which sends the query back to path identity.
 /// FAT and exFAT synthesize an index that can move, and one that changed between
 /// scans would read as a different file.
+///
+/// The prune also reads the volume serial on its own, for a directory, so
+/// `FILE_FLAG_BACKUP_SEMANTICS` below is what lets it open one.
 #[cfg(windows)]
-fn windows_identity(path: &Path) -> (i64, i64) {
+pub(crate) fn windows_identity(path: &Path) -> (i64, i64) {
     use std::os::windows::ffi::OsStrExt;
 
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -278,32 +281,6 @@ fn windows_identity(path: &Path) -> (i64, i64) {
 #[cfg(not(any(unix, windows)))]
 fn file_identity(_metadata: &std::fs::Metadata, _path: &Path) -> (i64, i64) {
     (0, 0)
-}
-
-/// The filesystem a path lives on: the Unix device number, the Windows volume
-/// serial number, or `0` where neither is available. Best-effort — every caller
-/// treats `0` as "unknown" and degrades accordingly, which is better than
-/// failing a scan over a heuristic.
-pub(crate) fn path_device(path: &Path) -> i64 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(path).map(|m| m.dev() as i64).unwrap_or(0)
-    }
-
-    // `FILE_FLAG_BACKUP_SEMANTICS` is what lets this open directories, which
-    // `File::open` refuses; the prune guard asks about ancestor directories, not
-    // just files.
-    #[cfg(windows)]
-    {
-        windows_identity(path).0
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = path;
-        0
-    }
 }
 
 pub fn spawn_hash_workers(

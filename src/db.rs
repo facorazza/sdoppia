@@ -11,7 +11,6 @@ use std::{
 
 use crate::{
     error::{DedupError, Result},
-    fs,
     models::{Duplicates, FileMetadata, HashedFile},
     note,
     report::{Format, Report},
@@ -332,22 +331,27 @@ pub async fn prune_missing(
 /// Only `NotFound` counts. A permission problem or any other error keeps the
 /// entry: a stale row costs a few bytes, a dropped live one corrupts the report.
 ///
-/// An unmounted volume leaves its mount point directory in place on the parent
-/// filesystem, so everything below it reads as deleted while the data is merely
-/// unreachable. Comparing the recorded device against the one the nearest
-/// surviving ancestor is now on tells the two apart: a deleted file's parent is
-/// on the same volume, an unmounted volume's ancestor is not. With no recorded
-/// device there is no way to tell them apart, so the entry is kept.
+/// With no recorded device there is no way to tell a deletion from an unmounted
+/// volume, so the entry is kept. Entries written by sdoppia 0.8 and earlier on
+/// Windows land here, because an unchanged file is not rewritten by a rescan.
 fn is_gone(path: &Path, recorded_dev: i64) -> bool {
     match std::fs::symlink_metadata(path) {
         Ok(_) => false,
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => false,
         Err(_) if recorded_dev == 0 => false,
+        // Device numbers are assigned per boot on Unix, so a recorded one cannot
+        // say whether its volume is still mounted; comparing it with the
+        // surviving ancestor kept every entry recorded before a renumber forever.
+        #[cfg(not(windows))]
+        Err(_) => true,
+        // A Windows volume serial survives a remount. A surviving ancestor that
+        // reports another one means the volume is not mounted, so keep the entry.
+        #[cfg(windows)]
         Err(_) => path
             .ancestors()
             .skip(1)
             .find(|a| std::fs::metadata(a).is_ok())
-            .is_some_and(|a| fs::path_device(a) == recorded_dev),
+            .is_some_and(|a| crate::fs::windows_identity(a).0 == recorded_dev),
     }
 }
 
@@ -912,6 +916,46 @@ mod tests {
             assert!(in_scope(&descendant, &scope), "{descendant:?}");
             assert!(!in_scope(&sibling, &scope), "{sibling:?}");
         }
+    }
+
+    /// A file that exists is never gone, whatever device the row recorded.
+    #[test]
+    fn an_existing_file_is_not_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("here.txt");
+        fs::write(&path, b"x").unwrap();
+
+        assert!(!is_gone(&path, 0));
+        assert!(!is_gone(&path, 1));
+    }
+
+    /// A missing path with no recorded device cannot be told from one on an
+    /// unmounted volume, so it stays.
+    #[test]
+    fn a_missing_path_without_an_identity_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never-existed.txt");
+
+        assert!(!is_gone(&path, 0));
+    }
+
+    /// A deleted file recorded under a device number the surviving ancestor no
+    /// longer reports is still gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_renumbered_device_does_not_keep_a_deleted_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gone.txt");
+        fs::write(&path, b"x").unwrap();
+
+        let recorded = fs::metadata(&path).unwrap().dev() as i64;
+        assert_ne!(recorded, 0, "the platform must report a device here");
+        fs::remove_file(&path).unwrap();
+
+        assert!(is_gone(&path, recorded));
+        assert!(is_gone(&path, recorded.wrapping_add(1)));
     }
 
     /// A hash group whose stored sizes disagree pushes `size * (copies - 1)`

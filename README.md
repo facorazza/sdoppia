@@ -262,12 +262,22 @@ exists` when there was nothing to remove, so removing no entries is never
 mistaken for not having run. The line goes to stderr, under the progress bars
 and above the report.
 
-An unmounted volume is the interesting case. Its mount point directory stays on
-the parent filesystem, so every path below it looks deleted while the data is
-merely unreachable. To tell that apart from a real deletion, the prune compares
-the filesystem recorded for the entry against the one its nearest surviving
-ancestor is now on; when they differ, the volume is not mounted and the entry is
-kept until you scan it again.
+An unmounted volume is the interesting case on Windows, where the recorded
+device is a volume serial number that survives a remount. Its mount point
+directory stays on the parent filesystem, so every path below it looks deleted
+while the data is merely unreachable. When the nearest surviving ancestor
+reports a different serial, the volume is not mounted and the entry is kept
+until you scan it again.
+
+Unix cannot make that distinction. Device numbers there are assigned per boot
+and can move under a volume — a device-mapper major, for instance, is renumbered
+across reboots — so a number recorded by an earlier boot says nothing about
+whether the volume is mounted now. Comparing it with the surviving ancestor
+would keep every entry recorded before the renumber forever: the file is gone,
+the number is stale, and no prune can ever remove the row. On Unix the file
+being gone is the whole answer. An entry for a volume that is mounted again
+later is rebuilt by the next scan, which costs a rehash; a stored row for a file
+that no longer exists costs a report that never stops naming it.
 
 Where a platform cannot report which filesystem a file is on, entries are never
 pruned, since there would be no way to tell a deletion from an unmount. That
