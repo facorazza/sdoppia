@@ -5,6 +5,20 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] — 2026-10-22
+
+### Fixed
+
+- `scan --prune` no longer keeps entries for files deleted from a filesystem
+  whose device number changed since they were recorded. Device numbers are
+  assigned per boot on Unix and move under a volume — a device-mapper major is
+  renumbered across reboots — so every entry recorded before the change looked
+  like an unmounted volume and could never be pruned: the files were gone, the
+  number no longer matched their surviving ancestor, and the report kept naming
+  a deleted tree. On Unix a missing file with a recorded device is now pruned.
+  Windows keeps the unmount check, where the recorded number is a volume serial
+  that survives a remount.
+
 ## [0.9.0] — 2026-10-20
 
 ### Added
